@@ -12,6 +12,7 @@ public sealed partial class MainWindow
 {
     sealed record FingerprintChoice(string Value, string Label);
     sealed record FingerprintRegion(string Name, string Locale, string Timezone);
+    sealed record FingerprintEditorBinding(Action<Dictionary<string, object?>> Fill, Action<JsonElement, bool> Recommend);
     static readonly FingerprintRegion[] FingerprintRegions = {
         new("中国大陆", "zh-CN", "Asia/Shanghai"), new("中国香港", "zh-HK", "Asia/Hong_Kong"),
         new("中国台湾", "zh-TW", "Asia/Taipei"), new("日本", "ja-JP", "Asia/Tokyo"),
@@ -32,14 +33,14 @@ public sealed partial class MainWindow
         new("阿根廷", "es-AR", "America/Argentina/Buenos_Aires"), new("南非", "en-ZA", "Africa/Johannesburg"),
     };
 
-    Action<Dictionary<string, object?>> BuildFingerprintEditor(StackPanel panel, Func<string, string, string> read)
+    FingerprintEditorBinding BuildFingerprintEditor(StackPanel panel, Func<string, string, string> read)
     {
         bool Supported(string key) => capabilities.ValueKind != JsonValueKind.Object || !capabilities.TryGetProperty("supportedFields", out var fields)
             || !fields.TryGetProperty(key, out var enabled) || enabled.ValueKind != JsonValueKind.False;
         string FormatNumber(string value) => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) ? number.ToString(CultureInfo.InvariantCulture) : value;
         var choiceStyle = (Style)XamlReader.Parse("""
         <Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="ComboBox">
-          <Setter Property="Background" Value="White"/><Setter Property="Foreground" Value="#172033"/><Setter Property="BorderBrush" Value="#DFE5EE"/>
+          <Setter Property="Background" Value="#202622"/><Setter Property="Foreground" Value="#E7ECE9"/><Setter Property="BorderBrush" Value="#303A35"/>
           <Setter Property="BorderThickness" Value="1"/><Setter Property="MinHeight" Value="38"/><Setter Property="Padding" Value="11,8,30,8"/>
           <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
           <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBox">
@@ -47,20 +48,20 @@ public sealed partial class MainWindow
               <ToggleButton Focusable="False" IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}" ClickMode="Press">
                 <ToggleButton.Template><ControlTemplate TargetType="ToggleButton">
                   <Border x:Name="shell" Background="{Binding Background, RelativeSource={RelativeSource AncestorType=ComboBox}}" BorderBrush="{Binding BorderBrush, RelativeSource={RelativeSource AncestorType=ComboBox}}" BorderThickness="1" CornerRadius="6">
-                    <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,13,0" Data="M0,0 L4,4 L8,0" Stroke="#657187" StrokeThickness="1.5"/>
+                    <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,13,0" Data="M0,0 L4,4 L8,0" Stroke="#97A39D" StrokeThickness="1.5"/>
                   </Border>
-                  <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="shell" Property="BorderBrush" Value="#93B8F5"/></Trigger></ControlTemplate.Triggers>
+                  <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="shell" Property="BorderBrush" Value="#47B796"/></Trigger></ControlTemplate.Triggers>
                 </ControlTemplate></ToggleButton.Template>
               </ToggleButton>
               <TextBlock IsHitTestVisible="False" Margin="{TemplateBinding Padding}" VerticalAlignment="Center" Text="{Binding SelectedItem.Label, RelativeSource={RelativeSource TemplatedParent}}" TextTrimming="CharacterEllipsis"/>
               <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}" AllowsTransparency="True" Focusable="False">
-                <Border Background="White" BorderBrush="#DFE5EE" BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="300">
+                <Border Background="#202622" BorderBrush="#303A35" BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="300">
                   <ScrollViewer CanContentScroll="True"><ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/></ScrollViewer>
                 </Border>
               </Popup>
             </Grid>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter Property="BorderBrush" Value="#2563EB"/></Trigger>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter Property="BorderBrush" Value="#28D6AA"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.5"/></Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate></Setter.Value></Setter>
@@ -86,10 +87,14 @@ public sealed partial class MainWindow
             System.Windows.Automation.AutomationProperties.SetName(input, label); if (key != null && !Supported(key)) { input.IsEnabled = false; input.ToolTip = "当前内核不支持此设置"; } parent.Children.Add(input); return input;
         }
         panel.Children.Add(new TextBlock { Text = "当前内核  CloakBrowser " + (capabilities.ValueKind == JsonValueKind.Object ? Str(capabilities, "engineVersion") : "待连接"), Foreground = Accent, FontSize = 11, Margin = new Thickness(0, 0, 0, 12) });
-        var banner = new Border { Background = Hex("#EFF5FF"), BorderBrush = Hex("#C9DCF9"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(13), Margin = new Thickness(0, 0, 0, 16) };
+        var banner = new Border { Background = Hex("#203B33"), BorderBrush = Hex("#345D4F"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(13), Margin = new Thickness(0, 0, 0, 16) };
         var bannerPanel = new StackPanel(); var bannerHeading = new DockPanel { LastChildFill = true }; bannerPanel.Children.Add(bannerHeading);
-        var bannerTitle = new TextBlock { Text = "选地区，一键生成", FontSize = 14, FontWeight = FontWeights.SemiBold, Foreground = Text, VerticalAlignment = VerticalAlignment.Center };
-        bannerPanel.Children.Add(new TextBlock { Text = "地区方案同时填写语言和时区。随机生成保留地区、平台和代理，替换其余指纹设置。", Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 5, 0, 0) }); banner.Child = bannerPanel; panel.Children.Add(banner);
+        var bannerTitle = new TextBlock { Text = "匹配出口地区，一键生成", FontSize = 14, FontWeight = FontWeights.SemiBold, Foreground = Text, VerticalAlignment = VerticalAlignment.Center };
+        bannerPanel.Children.Add(new TextBlock { Text = "检测真实出口国家后匹配语言和时区；随机指纹保留地区、平台和代理。", Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 5, 0, 0) }); banner.Child = bannerPanel; panel.Children.Add(banner);
+        var autoRegion = new CheckBox { Content = "根据检测到的出口国家自动匹配地区", IsChecked = read("regionMode", "proxy") == "proxy", Margin = new Thickness(0, 0, 0, 10), Foreground = Text };
+        System.Windows.Automation.AutomationProperties.SetName(autoRegion, "自动匹配出口地区"); panel.Children.Add(autoRegion);
+        var recommendation = new TextBlock { Text = "选择代理后会检测实际出口。多时区国家优先采用出口城市的时区。", Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12) };
+        System.Windows.Automation.AutomationProperties.SetName(recommendation, "出口地区推荐"); panel.Children.Add(recommendation);
         var region = Choice(panel, "地区方案", new[] { new FingerprintChoice("", "自定义地区组合") }.Concat(FingerprintRegions.Select((r, i) => new FingerprintChoice(i.ToString(), r.Name))), "");
         var geographic = Columns(panel);
         var languageOptions = FingerprintRegions.DistinctBy(r => r.Locale).Select(r => new FingerprintChoice(r.Locale, r.Locale + "  ·  " + r.Name)).ToList();
@@ -103,12 +108,49 @@ public sealed partial class MainWindow
         }
         var timezone = Choice(geographic.Right, "时区", zoneOptions, read("timezone", "Asia/Shanghai"));
         bool applyingRegion = false;
-        void SyncRegion() { if (applyingRegion) return; int index = Array.FindIndex(FingerprintRegions, r => r.Locale == Value(locale) && r.Timezone == Value(timezone)); region.SelectedValue = index < 0 ? "" : index.ToString(); }
+        bool applyingNetwork = false;
+        JsonElement lastNetwork = default;
+        void SyncRegion() { if (applyingRegion) return; int index = Array.FindIndex(FingerprintRegions, r => r.Locale == Value(locale) && r.Timezone == Value(timezone)); applyingRegion = true; region.SelectedValue = index < 0 ? "" : index.ToString(); applyingRegion = false; }
         region.SelectionChanged += (_, _) => {
-            if (!int.TryParse(Value(region), out var index) || applyingRegion) return; applyingRegion = true;
+            if (!int.TryParse(Value(region), out var index) || applyingRegion) return;
+            if (!applyingNetwork) autoRegion.IsChecked = false;
+            applyingRegion = true;
             locale.SelectedValue = FingerprintRegions[index].Locale; timezone.SelectedValue = FingerprintRegions[index].Timezone; applyingRegion = false;
         };
-        locale.SelectionChanged += (_, _) => SyncRegion(); timezone.SelectionChanged += (_, _) => SyncRegion(); SyncRegion();
+        locale.SelectionChanged += (_, _) => { if (!applyingRegion && !applyingNetwork) autoRegion.IsChecked = false; SyncRegion(); };
+        timezone.SelectionChanged += (_, _) => { if (!applyingRegion && !applyingNetwork) autoRegion.IsChecked = false; SyncRegion(); }; SyncRegion();
+        void Recommend(JsonElement network, bool apply) {
+            lastNetwork = network.Clone();
+            var code = NetworkCountryCode(network);
+            var candidates = FingerprintRegions.Where(r => r.Locale.Split('-').Last().Equals(code, StringComparison.OrdinalIgnoreCase)).ToArray();
+            if (!Str(network, "reachable").Equals("true", StringComparison.OrdinalIgnoreCase) || candidates.Length == 0) {
+                recommendation.Text = code.Length == 0 ? "尚未获取出口国家，保留当前地区；可重新检测。" : "出口为 " + NetworkCountryName(network) + "，暂无地区方案，请手动选择语言和时区。";
+                recommendation.Foreground = Muted; return;
+            }
+            string zone = Str(network, "timezone");
+            if (zone.Length > 0 && zoneOptions.All(z => z.Value != zone) && TimeZoneInfo.TryFindSystemTimeZoneById(zone, out _)) {
+                zoneOptions.Add(new(zone, zone + "  ·  出口时区")); timezone.Items.Refresh();
+            }
+            var chosen = candidates.FirstOrDefault(r => r.Timezone == zone) ?? candidates[0];
+            bool zoneKnown = zoneOptions.Any(z => z.Value == zone);
+            // A country alone cannot identify a US/Canadian/Australian time zone.
+            bool multiZone = new[] { "US", "CA", "AU", "RU", "BR", "MX", "ID" }.Contains(code);
+            bool canApply = zoneKnown || !multiZone;
+            var targetZone = zoneKnown ? zone : chosen.Timezone;
+            bool applied = apply && autoRegion.IsChecked == true && canApply;
+            if (applied) {
+                applyingNetwork = true;
+                if (zoneOptions.All(z => z.Value != targetZone)) throw new InvalidOperationException("推荐时区不可用。");
+                locale.SelectedValue = chosen.Locale; timezone.SelectedValue = targetZone;
+                applyingNetwork = false; SyncRegion();
+            }
+            recommendation.Text = (applied ? "已按出口匹配：" : "出口推荐：") + NetworkCountryName(network) + " · " + chosen.Locale
+                + (canApply ? " · " + targetZone : "。该国家有多个时区，暂未查到出口时区，请选择城市对应时区。")
+                + (applied ? "。保存并重新打开浏览器后生效。" : autoRegion.IsChecked != true ? "。当前保留手动配置，可勾选自动匹配。" : "")
+                + (Str(network, "rotatingExit").Equals("true", StringComparison.OrdinalIgnoreCase) ? " 出口正在变化，以本次检测为准。" : "");
+            recommendation.Foreground = applied ? WorkbenchTheme.Green : Muted;
+        }
+        autoRegion.Checked += (_, _) => { if (lastNetwork.ValueKind == JsonValueKind.Object) Recommend(lastNetwork, true); };
         var machine = Columns(panel);
         var platform = Choice(machine.Left, "系统平台", new[] { new FingerprintChoice("windows", "Windows"), new FingerprintChoice("macos", "macOS") }, read("fingerprintPlatform", "windows"), "fingerprintPlatform");
         var screenWidth = read("fingerprintScreenWidth", ""); var screenHeight = read("fingerprintScreenHeight", "");
@@ -141,14 +183,15 @@ public sealed partial class MainWindow
         generate.HorizontalAlignment = HorizontalAlignment.Right; generate.Margin = new Thickness(12, 0, 0, 0); DockPanel.SetDock(generate, Dock.Right); bannerHeading.Children.Add(generate); bannerHeading.Children.Add(bannerTitle);
         summary.Text = "已准备独立种子 " + seed.Text + "。可直接保存，或一键随机生成硬件与屏幕组合。"; panel.Children.Add(summary);
         var advanced = new Expander { Header = "高级设置 · 种子、噪声与自定义 WebGL", Foreground = Muted, Content = advancedPanel }; panel.Children.Add(advanced);
-        return body => {
+        return new(body => {
             int? OptionalInt(string value, string label) => value.Length == 0 ? null : int.TryParse(value, out var n) ? n : throw new InvalidOperationException(label + "必须是整数。");
             if (!int.TryParse(seed.Text.Trim(), out var seedValue) || seedValue < 1) throw new InvalidOperationException("指纹种子必须是 1 至 2147483647 的整数。");
             body["seed"] = seedValue; body["locale"] = Value(locale); body["timezone"] = Value(timezone); body["fingerprintPlatform"] = Value(platform);
+            body["regionMode"] = autoRegion.IsChecked == true ? "proxy" : "manual";
             body["hardwareConcurrency"] = OptionalInt(Value(cpu), "逻辑处理器数"); body["deviceMemory"] = Value(memory).Length == 0 ? null : double.Parse(Value(memory), CultureInfo.InvariantCulture);
             var dimensions = Value(screen).Split('x'); body["fingerprintScreenWidth"] = OptionalInt(dimensions[0], "屏幕宽度"); body["fingerprintScreenHeight"] = dimensions.Length == 1 ? null : OptionalInt(dimensions[1], "屏幕高度");
             body["taskbarHeight"] = OptionalInt(Value(taskbar), "任务栏高度"); body["fingerprintNoise"] = noise.IsChecked == true;
             body["gpuVendor"] = gpuVendor.Text.Trim(); body["gpuRenderer"] = gpuRenderer.Text.Trim();
-        };
+        }, Recommend);
     }
 }

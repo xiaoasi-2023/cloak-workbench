@@ -14,21 +14,30 @@ namespace CloakWorkbench;
 
 public sealed partial class MainWindow : Window
 {
-    static readonly Brush Bg = Hex("#F4F6FB"), Panel = Brushes.White, Line = WorkbenchTheme.Border;
+    static readonly Brush Bg = Hex("#141716"), Panel = Hex("#1B201E"), Line = WorkbenchTheme.Border;
     static readonly Brush Text = WorkbenchTheme.Ink, Muted = WorkbenchTheme.Muted, Accent = WorkbenchTheme.Blue;
     readonly HttpClient api = new() { BaseAddress = new Uri("http://127.0.0.1:8766/"), Timeout = TimeSpan.FromSeconds(40) };
     readonly StackPanel accountList = new(), tabs = new() { Orientation = Orientation.Horizontal };
     readonly Grid viewport = new();
+    readonly ColumnDefinition runningSidebarColumn = new() { Width = new GridLength(236) };
+    readonly ContentControl browserPlaceholder = new();
+    readonly TextBlock browserContext = new();
+    readonly List<Control> browserCommands = new();
+    Button? sidebarToggle, presentationButton;
+    bool runningSidebarCollapsed;
     readonly Grid environmentWorkspace = new();
     readonly ContentControl proxyWorkspace = new() { Visibility = Visibility.Collapsed };
+    readonly ContentControl diagnosticsWorkspace = new() { Visibility = Visibility.Collapsed };
+    readonly ContentControl accountWorkspace = new() { Visibility = Visibility.Collapsed };
     readonly Dictionary<string, Button> navigationButtons = new();
-    bool proxyPageVisible;
+    string currentPage = "环境工作台";
     readonly TextBox address = new();
     Button? createEnvironmentButton;
     readonly TextBlock status = new(), counts = new(), engine = new();
     readonly Dictionary<string, NativeBrowserHost> hosts = new();
     readonly Dictionary<string, JsonElement> profiles = new();
     readonly HashSet<string> launching = new();
+    readonly HashSet<string> closingProfiles = new();
     readonly List<string> messages = new();
     readonly string localDir = Path.Combine(Environment.GetEnvironmentVariable("CLOAK_WORKBENCH_ROOT") ?? AppContext.BaseDirectory, ".local");
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(2) };
@@ -45,18 +54,21 @@ public sealed partial class MainWindow : Window
         var token = Environment.GetEnvironmentVariable("CLOAK_WORKBENCH_TOKEN") ?? "";
         if (token.Length == 0) throw new InvalidOperationException("Use start-workbench.bat to launch the application.");
         api.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        Title = "Cloak Workbench · 浏览器环境工作台";
+        Title = "Cloak Workbench · 多账号工作台";
         Width = 1440; Height = 900; MinWidth = 1050; MinHeight = 680;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = Bg; Foreground = Text; WorkbenchTheme.Apply(this);
         BuildLayout();
         timer.Tick += async (_, _) => await Refresh();
-        Loaded += async (_, _) => { await Refresh(); timer.Start(); if (smoke) await Smoke(); else if (resume) await RestoreSession(); };
+        Loaded += async (_, _) => { await Refresh(); try { await LoadProxyCatalog(); RenderAccounts(); } catch (Exception ex) { Log("代理列表读取失败：" + ex.Message); } timer.Start(); if (smoke) await Smoke(); else if (resume) await RestoreSession(); };
         Closing += async (_, e) => {
             if (closing) return;
             e.Cancel = true; closing = true; timer.Stop();
-            foreach (var host in hosts.Values) { try { host.Detach(); } catch (Exception ex) { Log(ex.Message); } }
+            // Keep native parents alive until Chromium closes. Detaching first
+            // restores the standalone window and causes a desktop flash.
+            foreach (var host in hosts.Values) { try { host.ShowBrowser(false); } catch (Exception ex) { Log(ex.Message); } }
             try { await Api("shutdown", new { }); } catch (Exception ex) { Log("Shutdown: " + ex.Message); }
+            foreach (var host in hosts.Values) { try { host.Detach(showStandalone: false); } catch (Exception ex) { Log(ex.Message); } }
             SaveSnapshot(); Close();
         };
     }
@@ -67,7 +79,7 @@ public sealed partial class MainWindow : Window
     };
     static Button Button(string text, Action callback, bool primary = false) {
         var b = new Button { Content = text, Padding = new Thickness(12, 8, 12, 8), Margin = new Thickness(0, 0, 6, 0),
-            Background = primary ? Accent : Panel, Foreground = primary ? Brushes.White : Text,
+            Background = primary ? Accent : Panel, Foreground = primary ? Hex("#092219") : Text,
             BorderBrush = Line, BorderThickness = new Thickness(1), Cursor = Cursors.Hand };
         b.Click += (_, _) => callback(); return b;
     }
@@ -78,99 +90,61 @@ public sealed partial class MainWindow : Window
     static Button IconButton(string icon, string text, Action callback, bool primary = false) {
         var button = Button(text, callback, primary);
         var content = new StackPanel { Orientation = Orientation.Horizontal };
-        content.Children.Add(WorkbenchTheme.Icon(icon, primary ? Brushes.White : Text));
-        if (text.Length > 0) { var label = Label(text); label.Foreground = primary ? Brushes.White : Text; label.Margin = new Thickness(7, 0, 0, 0); content.Children.Add(label); }
+        content.Children.Add(WorkbenchTheme.Icon(icon, primary ? Hex("#092219") : Text));
+        if (text.Length > 0) { var label = Label(text); label.Foreground = primary ? Hex("#092219") : Text; label.Margin = new Thickness(7, 0, 0, 0); content.Children.Add(label); }
         button.Content = content; button.ToolTip = text.Length > 0 ? text : icon;
         System.Windows.Automation.AutomationProperties.SetName(button, text.Length > 0 ? text : icon switch { "back" => "后退", "forward" => "前进", "reload" => "刷新页面", "external" => "恢复独立窗口", "download" => "环境下载文件", "shield" => "验证当前环境", "browser" => "浏览器弹窗", "close" => "关闭环境浏览器", _ => icon }); return button;
     }
 
-    void BuildLayout()
-    {
-        var root = new Grid { Background = Bg }; root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(76) }); root.ColumnDefinitions.Add(new ColumnDefinition());
-        var rail = new DockPanel { Background = WorkbenchTheme.Navy, LastChildFill = true };
-        var logo = new Border { Background = Accent, CornerRadius = new CornerRadius(12), Width = 40, Height = 40, Margin = new Thickness(0, 20, 0, 30), Child = WorkbenchTheme.Icon("shield", Brushes.White, 23) };
-        DockPanel.SetDock(logo, Dock.Top); rail.Children.Add(logo);
-        var nav = new StackPanel();
-        foreach (var (icon, label, callback) in new (string, string, Action)[] { ("browser", "环境工作台", ShowBrowserPage), ("settings", "代理管理", ShowProxyPage), ("diagnostic", "运行诊断", ShowDiagnostics) }) {
-            var b = Button("", callback); b.Content = WorkbenchTheme.Icon(icon, Brushes.White, 22); b.Background = icon == "browser" ? Hex("#243451") : Brushes.Transparent; b.BorderThickness = new Thickness(0); b.Width = 48; b.Height = 48; b.Margin = new Thickness(0, 0, 0, 12); b.ToolTip = label; System.Windows.Automation.AutomationProperties.SetName(b, label); nav.Children.Add(b); navigationButtons[label] = b;
-        }
-        rail.Children.Add(nav); root.Children.Add(rail);
-        var workspace = environmentWorkspace; workspace.RowDefinitions.Add(new RowDefinition { Height = new GridLength(78) }); workspace.RowDefinitions.Add(new RowDefinition()); workspace.RowDefinitions.Add(new RowDefinition { Height = new GridLength(30) }); Grid.SetColumn(workspace, 1); root.Children.Add(workspace);
-        Grid.SetColumn(proxyWorkspace, 1); root.Children.Add(proxyWorkspace);
-        var header = new DockPanel { Margin = new Thickness(24, 0, 24, 0), LastChildFill = true };
-        var heading = new StackPanel { VerticalAlignment = VerticalAlignment.Center }; heading.Children.Add(new TextBlock { Text = "浏览器环境", FontSize = 23, FontWeight = FontWeights.SemiBold, Foreground = Text }); heading.Children.Add(new TextBlock { Text = "CLOAK WORKBENCH  /  独立会话 · 稳定环境", FontSize = 11, Foreground = Muted, Margin = new Thickness(0, 4, 0, 0) }); DockPanel.SetDock(heading, Dock.Left); header.Children.Add(heading);
-        engine.Text = "正在连接本地服务"; engine.Foreground = Muted; engine.FontSize = 12; engine.VerticalAlignment = VerticalAlignment.Center; engine.HorizontalAlignment = HorizontalAlignment.Right; header.Children.Add(engine); workspace.Children.Add(header);
-        var body = new Grid { Margin = new Thickness(20, 0, 20, 10) }; body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(278) }); body.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) }); body.ColumnDefinitions.Add(new ColumnDefinition()); Grid.SetRow(body, 1); workspace.Children.Add(body);
-
-        var accounts = new DockPanel();
-        var accountHead = new StackPanel(); DockPanel.SetDock(accountHead, Dock.Top);
-        var accountHeading = Label("环境列表", 15); accountHeading.FontWeight = FontWeights.SemiBold; accountHead.Children.Add(accountHeading); counts.Text = "0 个环境"; counts.Foreground = Muted; counts.Margin = new Thickness(0, 6, 0, 18);
-        accountHead.Children.Add(counts);
-        var create = IconButton("plus", "新建环境", () => EditProfile(null), true); createEnvironmentButton = create; create.HorizontalAlignment = HorizontalAlignment.Stretch; create.Margin = new Thickness(0, 0, 0, 8); accountHead.Children.Add(create);
-        var demos = Button("添加本地演示环境", async () => await Guard(CreateDemos)); demos.Margin = new Thickness(0); demos.Foreground = Muted; accountHead.Children.Add(demos); accounts.Children.Add(accountHead);
-        accounts.Children.Add(new ScrollViewer { Content = accountList, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(0, 12, 0, 0) });
-        var accountBox = Box(accounts, Panel, new Thickness(16)); accountBox.CornerRadius = new CornerRadius(12); accountBox.BorderThickness = new Thickness(1); body.Children.Add(accountBox);
-
-        var browser = new Grid(); browser.RowDefinitions.Add(new RowDefinition { Height = new GridLength(46) });
-        browser.RowDefinitions.Add(new RowDefinition { Height = new GridLength(48) }); browser.RowDefinitions.Add(new RowDefinition());
-        var tabScroll = new ScrollViewer { Content = tabs, HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        tabScroll.Margin = new Thickness(8, 8, 8, 0); browser.Children.Add(tabScroll);
-        var toolbar = new DockPanel { Margin = new Thickness(8, 5, 8, 5) }; Grid.SetRow(toolbar, 1); browser.Children.Add(toolbar);
-        foreach (var (icon, command, tooltip) in new[] { ("back", "back", "后退"), ("forward", "forward", "前进"), ("reload", "reload", "刷新页面") }) {
-            var b = IconButton(icon, "", async () => await Guard(async () => { if (selected != null) await Api($"profiles/{selected}/action", new { action = command }); })); b.ToolTip = tooltip; b.Padding = new Thickness(8); b.BorderThickness = new Thickness(0);
-            DockPanel.SetDock(b, Dock.Left); toolbar.Children.Add(b);
-        }
-        var external = IconButton("external", "", ToggleExternal); external.ToolTip = "恢复独立窗口"; DockPanel.SetDock(external, Dock.Right); toolbar.Children.Add(external);
-        var windows = IconButton("browser", "", ShowBrowserWindows); windows.ToolTip = "此环境的弹窗与文件对话框"; DockPanel.SetDock(windows, Dock.Right); toolbar.Children.Add(windows);
-        var downloads = IconButton("download", "", async () => await Guard(ShowDownloads)); downloads.ToolTip = "环境下载文件"; DockPanel.SetDock(downloads, Dock.Right); toolbar.Children.Add(downloads);
-        var validate = IconButton("shield", "", async () => await Guard(ShowEnvironment)); validate.ToolTip = "验证当前环境"; DockPanel.SetDock(validate, Dock.Right); toolbar.Children.Add(validate);
-        var navigate = Button("前往", async () => await Guard(Navigate)); DockPanel.SetDock(navigate, Dock.Right); toolbar.Children.Add(navigate);
-        address.Background = Bg; address.Foreground = Text; address.BorderBrush = Line; address.Padding = new Thickness(10, 6, 10, 6); address.FontFamily = new FontFamily("Cascadia Code, Consolas"); address.FontSize = 12; address.Margin = new Thickness(0, 0, 6, 0);
-        address.VerticalContentAlignment = VerticalAlignment.Center; address.KeyDown += async (_, e) => { if (e.Key == Key.Enter) await Guard(Navigate); };
-        System.Windows.Automation.AutomationProperties.SetName(address, "AddressBar");
-        toolbar.Children.Add(address);
-        viewport.Background = Panel; Grid.SetRow(viewport, 2); browser.Children.Add(viewport);
-        var welcome = new StackPanel { VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center };
-        var welcomeIcon = new Border { Background = Hex("#EFF5FF"), Width = 64, Height = 64, CornerRadius = new CornerRadius(16), HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 20), Child = WorkbenchTheme.Icon("browser", Accent, 32) }; welcome.Children.Add(welcomeIcon);
-        var welcomeTitle = Label("从一个独立环境开始", 23); welcomeTitle.HorizontalAlignment = HorizontalAlignment.Center; welcome.Children.Add(welcomeTitle);
-        var description = Label("配置代理与指纹，再打开浏览器。每个环境单独保存登录状态。", 12, Muted); description.Margin = new Thickness(0, 12, 0, 24); welcome.Children.Add(description);
-        var welcomeAction = IconButton("plus", "创建第一个环境", () => EditProfile(null), true); welcomeAction.HorizontalAlignment = HorizontalAlignment.Center; welcome.Children.Add(welcomeAction);
-        viewport.Children.Add(welcome);
-        var browserSurface = new Border { Child = browser, Background = Panel, BorderBrush = Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(12) }; Grid.SetColumn(browserSurface, 2); body.Children.Add(browserSurface);
-        status.Text = "就绪"; status.Foreground = Muted; status.Margin = new Thickness(16, 0, 16, 0);
-        status.FontSize = 11; Grid.SetRow(status, 2); workspace.Children.Add(status); Content = root;
-    }
-
     void UpdateNavigation()
     {
-        navigationButtons["环境工作台"].Background = proxyPageVisible ? Brushes.Transparent : Hex("#243451");
-        navigationButtons["代理管理"].Background = proxyPageVisible ? Hex("#243451") : Brushes.Transparent;
+        foreach (var (key, button) in navigationButtons)
+            button.Background = key == currentPage ? Hex("#203B33") : Brushes.Transparent;
     }
     void ShowProxyPage()
     {
+        proxyWorkspace.Content ??= CreateProxyManagementPage(this);
+        ShowManagementPage(proxyWorkspace, "代理管理");
+    }
+    void ShowManagementPage(ContentControl page, string name)
+    {
         // Hide native children before showing WPF content, releasing browser input.
         foreach (var host in hosts.Values) { host.ShowBrowser(false); host.Visibility = Visibility.Hidden; }
-        proxyPageVisible = true;
+        currentPage = name;
         environmentWorkspace.Visibility = Visibility.Collapsed;
-        proxyWorkspace.Content ??= CreateProxyManagementPage(this);
-        proxyWorkspace.Visibility = Visibility.Visible;
+        proxyWorkspace.Visibility = page == proxyWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        diagnosticsWorkspace.Visibility = page == diagnosticsWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        accountWorkspace.Visibility = page == accountWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        loginAccountsWorkspace.Visibility = page == loginAccountsWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        profileSettingsWorkspace.Visibility = page == profileSettingsWorkspace ? Visibility.Visible : Visibility.Collapsed;
         UpdateNavigation();
-        proxyWorkspace.Focus();
+        page.Focus();
     }
     void ShowBrowserPage()
     {
-        proxyPageVisible = false;
+        currentPage = "环境工作台";
         proxyWorkspace.Visibility = Visibility.Collapsed;
+        diagnosticsWorkspace.Visibility = Visibility.Collapsed;
+        accountWorkspace.Visibility = Visibility.Collapsed;
+        loginAccountsWorkspace.Visibility = Visibility.Collapsed;
+        profileSettingsWorkspace.Visibility = Visibility.Collapsed;
         environmentWorkspace.Visibility = Visibility.Visible;
         UpdateNavigation();
-        if (selected != null && hosts.ContainsKey(selected)) Select(selected);
+        if (selected != null && RuntimeIds().Contains(selected)) Select(selected);
         else createEnvironmentButton?.Focus();
     }
 
     async Task<JsonElement> Api(string path, object? body = null)
     {
         HttpResponseMessage response;
-        if (body == null) response = await api.GetAsync(path);
+        if (body == null) {
+            // Loopback reads can be interrupted as the local server closes a
+            // connection. Retry reads only; a submitted mutation is never replayed.
+            for (int attempt = 0; ; attempt++) {
+                try { response = await api.GetAsync(path); break; }
+                catch (HttpRequestException) when (attempt < 2 && !closing) { await Task.Delay(120 * (attempt + 1)); }
+            }
+        }
         else response = await api.PostAsync(path, new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json"));
         using (response) {
             var text = await response.Content.ReadAsStringAsync();
@@ -188,88 +162,132 @@ public sealed partial class MainWindow : Window
     {
         if (polling || closing) return; polling = true;
         try {
-            var result = await Api("profiles"); profiles.Clear();
+            var result = await Api("profiles");
+            if (closing) return;
+            var previousSelection = selected;
+            profiles.Clear();
             foreach (var p in result.GetProperty("profiles").EnumerateArray()) profiles[Str(p, "id")] = p.Clone();
             foreach (var id in hosts.Keys.ToList()) {
+                if (launching.Contains(id) || closingProfiles.Contains(id)) continue;
                 if (!profiles.TryGetValue(id, out var p) || Str(p, "state") is not ("running" or "starting") || !NativeBrowserHost.IsWindowAlive(hosts[id].AttachedHandle) && hosts[id].AttachedHandle != IntPtr.Zero) {
-                    hosts[id].Detach(); viewport.Children.Remove(hosts[id]); hosts[id].Dispose(); hosts.Remove(id);
+                    hosts[id].Detach(showStandalone: false); viewport.Children.Remove(hosts[id]); hosts[id].Dispose(); hosts.Remove(id);
                     if (selected == id) selected = null;
                 }
             }
-            counts.Text = $"{profiles.Count} 个环境 · {hosts.Count} 个浏览器";
+            if (previousSelection != null && (selected == null || !RuntimeIds().Contains(selected))) {
+                selected = hosts.Keys.FirstOrDefault() ?? RuntimeIds().FirstOrDefault();
+                if (selected != null && currentPage == "环境工作台") Select(selected);
+            }
+            UpdateRuntimeCounts();
             if (capabilities.ValueKind != JsonValueKind.Object) capabilities = await Api("capabilities");
-            engine.Text = "CloakBrowser " + Str(capabilities, "engineVersion") + "  ·  本机原生引擎";
-            if (!proxyPageVisible && selected != null && hosts.TryGetValue(selected, out var visibleHost)) visibleHost.RefreshBounds();
-            RenderAccounts(); RenderTabs();
+            engine.Text = "CloakBrowser " + Str(capabilities, "engineVersion").Split('.').First() + "\n本地服务已连接";
+            if (currentPage == "环境工作台" && selected != null && hosts.TryGetValue(selected, out var visibleHost)) visibleHost.RefreshBounds();
+            RenderAccounts(); RenderTabs(); RenderAccountCenter();
+            UpdateBrowserPresentation();
+            UpdateGlobalActivity();
+            if (currentPage == "账号列表") await LoadLoginAccounts();
             if (selected != null && profiles.TryGetValue(selected, out var current) && !address.IsKeyboardFocusWithin) address.Text = Str(current, "url", Str(current, "startUrl"));
             SaveSnapshot();
         } catch (Exception e) { engine.Text = "服务连接失败"; Log(e.Message); }
         finally { polling = false; }
     }
 
-    void RenderAccounts()
-    {
-        // Preserve the actual controls (and keyboard focus) during status polling.
-        var signature = JsonSerializer.Serialize(profiles.Select(kv => new {
-            id = kv.Key, name = Str(kv.Value, "name"), locale = Str(kv.Value, "locale"),
-            timezone = Str(kv.Value, "timezone"), seed = Str(kv.Value, "seed"), state = Str(kv.Value, "state"),
-            proxy = Str(kv.Value, "proxy"), proxyId = Str(kv.Value, "proxyId"), attached = hosts.ContainsKey(kv.Key), active = selected == kv.Key
-        }));
-        if (signature == renderedAccounts) return;
-        renderedAccounts = signature;
-        accountList.Children.Clear();
-        foreach (var (id, p) in profiles) {
-            var card = new StackPanel(); var top = new DockPanel(); var running = Str(p, "state") == "running";
-            var state = Label(running ? "运行中" : "已保存", 10, running ? WorkbenchTheme.Green : Muted); state.Margin = new Thickness(8, 0, 0, 0); DockPanel.SetDock(state, Dock.Right); top.Children.Add(state);
-            var name = Label(Str(p, "name"), 13); name.FontWeight = FontWeights.SemiBold; name.TextTrimming = TextTrimming.CharacterEllipsis; top.Children.Add(name); card.Children.Add(top);
-            var details = Label($"{Str(p, "locale")}  /  {Str(p, "timezone")}\n{(Str(p, "proxy").Length > 0 || Str(p, "proxyId").Length > 0 ? "代理连接" : "直连网络")}  ·  种子 {Str(p, "seed")}", 11, Muted);
-            details.Margin = new Thickness(0, 9, 0, 12); details.LineHeight = 19; card.Children.Add(details);
-            var controls = new WrapPanel();
-            controls.Children.Add(Button(hosts.ContainsKey(id) ? "切换" : "打开", async () => await Guard(() => Launch(id)), selected == id));
-            controls.Children.Add(Button("配置", () => EditProfile(id)));
-            if (Str(p, "state") == "running") controls.Children.Add(Button("关闭", async () => await Guard(() => CloseProfile(id))));
-            card.Children.Add(controls);
-            var b = new Border { Child = card, Padding = new Thickness(12), Margin = new Thickness(0, 0, 0, 10), CornerRadius = new CornerRadius(8),
-                Background = id == selected ? Hex("#EFF5FF") : Brushes.White, BorderBrush = id == selected ? Hex("#A6C1FA") : Line, BorderThickness = new Thickness(1) };
-            accountList.Children.Add(b);
-        }
-    }
     void RenderTabs()
     {
-        var signature = JsonSerializer.Serialize(hosts.Keys.Select(id => new {
-            id, name = profiles.TryGetValue(id, out var p) ? Str(p, "name") : id, active = id == selected
+        var signature = JsonSerializer.Serialize(RuntimeIds().Select(id => new {
+            id, name = profiles.TryGetValue(id, out var p) ? Str(p, "name") : id, active = id == selected, mode = RuntimeLabel(id)
         }));
         if (signature == renderedTabs) return;
         renderedTabs = signature;
         tabs.Children.Clear();
-        foreach (var id in hosts.Keys) {
+        foreach (var id in RuntimeIds()) {
             var name = profiles.TryGetValue(id, out var p) ? Str(p, "name") : id;
-            var tabGroup = new StackPanel { Orientation = Orientation.Horizontal, Background = id == selected ? Hex("#EFF5FF") : Brushes.Transparent, Margin = new Thickness(0, 0, 6, 0) };
-            var tab = IconButton("browser", name, () => Select(id)); tab.BorderThickness = new Thickness(0); tab.Background = Brushes.Transparent; tab.Padding = new Thickness(10, 7, 5, 7); tab.MaxWidth = 205; tabGroup.Children.Add(tab);
-            var close = IconButton("close", "", async () => await Guard(() => CloseProfile(id))); close.ToolTip = "关闭环境浏览器"; close.Padding = new Thickness(5); close.BorderThickness = new Thickness(0); close.Background = Brushes.Transparent; tabGroup.Children.Add(close); tabs.Children.Add(new Border { Child = tabGroup, CornerRadius = new CornerRadius(6) });
+            var tabGroup = new StackPanel { Orientation = Orientation.Horizontal, Background = id == selected ? Hex("#203B33") : Brushes.Transparent, Margin = new Thickness(0, 0, 6, 0) };
+            var tab = IconButton("browser", name + (hosts.ContainsKey(id) ? "" : " · " + RuntimeLabel(id)), () => Select(id)); tab.BorderThickness = new Thickness(0); tab.Background = Brushes.Transparent; tab.Padding = new Thickness(10, 7, 5, 7); tab.MaxWidth = 205; tab.ToolTip = name + " · " + RuntimeLabel(id); tab.IsEnabled = !closingProfiles.Contains(id); tabGroup.Children.Add(tab);
+            var close = IconButton("close", "", async () => await Guard(() => CloseProfile(id))); close.ToolTip = "关闭浏览器并保留环境数据"; close.Padding = new Thickness(5); close.BorderThickness = new Thickness(0); close.Background = Brushes.Transparent; close.IsEnabled = !launching.Contains(id) && !closingProfiles.Contains(id); tabGroup.Children.Add(close); tabs.Children.Add(new Border { Child = tabGroup, CornerRadius = new CornerRadius(6) });
         }
     }
-    async Task Launch(string id)
+    IEnumerable<string> RuntimeIds() => profiles.Where(kv => Str(kv.Value, "state") is "running" or "starting" || launching.Contains(kv.Key) || closingProfiles.Contains(kv.Key)).Select(kv => kv.Key).ToArray();
+    string RuntimeLabel(string id) => closingProfiles.Contains(id) ? "正在关闭" : launching.Contains(id) || profiles.TryGetValue(id, out var p) && Str(p, "state") == "starting" ? "正在打开" : hosts.ContainsKey(id) ? "工作台内" : "独立窗口";
+    void UpdateRuntimeCounts() => counts.Text = $"{RuntimeIds().Count()} 个运行环境 · 共 {profiles.Count} 个已保存";
+    void ToggleRunningSidebar()
     {
-        if (hosts.ContainsKey(id)) { Select(id); return; }
+        runningSidebarCollapsed = !runningSidebarCollapsed;
+        runningSidebarColumn.Width = new GridLength(runningSidebarCollapsed ? 0 : 236);
+        if (sidebarToggle != null) { sidebarToggle.ToolTip = runningSidebarCollapsed ? "展开运行环境列表" : "收起运行环境列表"; System.Windows.Automation.AutomationProperties.SetName(sidebarToggle, runningSidebarCollapsed ? "展开运行环境列表" : "收起运行环境列表"); }
+        viewport.UpdateLayout();
+        if (selected != null && hosts.TryGetValue(selected, out var host)) host.RefreshBounds();
+    }
+    void UpdateBrowserPresentation()
+    {
+        bool active = selected != null && profiles.TryGetValue(selected, out var p) && Str(p, "state") == "running" && !launching.Contains(selected) && !closingProfiles.Contains(selected);
+        foreach (var command in browserCommands) command.IsEnabled = active;
+        if (presentationButton != null) presentationButton.ToolTip = selected != null && hosts.ContainsKey(selected) ? "切换为独立窗口" : "嵌回工作台";
+        if (selected != null && profiles.TryGetValue(selected, out var profile) && RuntimeIds().Contains(selected)) {
+            var network = AccountNetworkObservation(profile);
+            var login = LoginObservationLabel(profile) + (IsCurrentLoginObservation(profile) && AccountState(profile) == "logged_in" ? " · " + LoginIdentityLabel(profile) : "");
+            browserContext.Text = Str(profile, "name") + "   /   " + RuntimeLabel(selected) + "   /   " + login + "   /   " + (network.ValueKind == JsonValueKind.Object ? "上次出口 · " + NetworkCountryName(network) : "出口国家未检测");
+            browserContext.ToolTip = "网站登录与绑定账号身份分别核验；出口信息为上次检测结果。";
+        } else browserContext.Text = "浏览器工作台  /  打开原环境可继续使用保存的会话";
+        browserPlaceholder.Visibility = selected != null && hosts.ContainsKey(selected) ? Visibility.Collapsed : Visibility.Visible;
+        if (browserPlaceholder.Visibility != Visibility.Visible) return;
+        var panel = new StackPanel { MaxWidth = 410, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(30) };
+        bool external = selected != null && profiles.TryGetValue(selected, out var current) && Str(current, "state") == "running" && !launching.Contains(selected) && !closingProfiles.Contains(selected);
+        panel.Children.Add(new TextBlock { Text = external ? "浏览器正在独立窗口中运行" : RuntimeIds().Any() ? "选择一个运行环境" : "开始你的浏览器会话", Foreground = Text, FontSize = 23, FontWeight = FontWeights.SemiBold, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(new TextBlock { Text = external ? "网页与登录状态保持不变。你可以切到独立窗口，或把它嵌回工作台。" : "在环境管理中打开已有环境，或创建新的独立环境。关闭浏览器会保留浏览器数据。", Foreground = Muted, FontSize = 13, TextAlignment = TextAlignment.Center, TextWrapping = TextWrapping.Wrap, LineHeight = 23, Margin = new Thickness(0, 15, 0, 22) });
+        var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center };
+        if (external) {
+            var id = selected!; actions.Children.Add(Button("切到独立窗口", () => FocusExternal(id), true)); actions.Children.Add(Button("嵌回工作台", async () => await Guard(() => Launch(id))));
+        } else { actions.Children.Add(Button("打开已有环境", ShowAccountCenter, true)); actions.Children.Add(Button("新建环境", () => EditAccount(null))); }
+        panel.Children.Add(actions); browserPlaceholder.Content = panel;
+    }
+    void FocusExternal(string id)
+    {
+        if (!profiles.TryGetValue(id, out var p) || Str(p, "state") != "running") return;
+        var hwnd = NativeBrowserHost.FindBrowserWindow(Num(p, "pid"), includeHidden: true);
+        if (hwnd == IntPtr.Zero) { Log("独立窗口尚未就绪，请稍后重试。"); return; }
+        if (IsIconic(hwnd)) ShowWindow(hwnd, 9); else ShowWindow(hwnd, 5);
+        SetForegroundWindow(hwnd);
+    }
+    Task Launch(string id) => LaunchQueued(id, selectBrowser: true);
+    async Task LaunchQueued(string id, bool selectBrowser)
+    {
+        if (closing || closingProfiles.Contains(id)) return;
+        if (hosts.ContainsKey(id)) { if (selectBrowser) Select(id); return; }
         if (!launching.Add(id)) return;
+        bool existingRuntime = profiles.TryGetValue(id, out var savedRuntime) && Str(savedRuntime, "state") is "running" or "starting";
+        RenderAccounts(); RenderTabs();
         try {
-        Log("正在打开浏览器环境…"); var runtime = await Api($"profiles/{id}/launch", new { });
+        Log("正在打开浏览器环境…"); var runtime = await Api($"profiles/{id}/launch", new { embedded = true });
+        if (closing) return;
         var pid = Num(runtime, "pid"); IntPtr hwnd = IntPtr.Zero;
-        for (int i = 0; i < 100; i++) { hwnd = NativeBrowserHost.FindBrowserWindow(pid); if (hwnd != IntPtr.Zero) break; await Task.Delay(150); }
-        if (hwnd == IntPtr.Zero) throw new InvalidOperationException("未找到浏览器窗口。浏览器保留为独立窗口，请查看运行诊断。");
+        for (int i = 0; i < 100; i++) { hwnd = NativeBrowserHost.FindBrowserWindow(pid, includeHidden: true); if (hwnd != IntPtr.Zero || closing) break; await Task.Delay(150); }
+        if (closing) return;
+        if (hwnd == IntPtr.Zero) {
+            if (!existingRuntime) await Api($"profiles/{id}/close", new { });
+            throw new InvalidOperationException(existingRuntime ? "未找到现有浏览器窗口，已保留运行实例。请稍后重试或查看运行诊断。" : "未找到浏览器窗口，已结束本次启动。请查看运行诊断后重试。");
+        }
         var host = new NativeBrowserHost(); host.Diagnostic += Log;
+        host.ShowBrowser(false);
+        if (!selectBrowser) host.Visibility = Visibility.Hidden;
         hosts[id] = host; viewport.Children.Add(host); viewport.UpdateLayout();
         await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Loaded);
-        try { host.Attach(hwnd); }
-        catch { hosts.Remove(id); viewport.Children.Remove(host); host.Dispose(); throw; }
-        Select(id); await Refresh(); Log("浏览器已嵌入工作台，可直接输入和操作。"); SaveSnapshot();
-        } finally { launching.Remove(id); }
+        if (closing) { hosts.Remove(id); viewport.Children.Remove(host); host.Dispose(); return; }
+        try { host.Attach(hwnd, showStandaloneOnDetach: true); }
+        catch { hosts.Remove(id); viewport.Children.Remove(host); host.Dispose(); if (!existingRuntime) await Api($"profiles/{id}/close", new { }); throw; }
+        if (selectBrowser) Select(id);
+        else { host.ShowBrowser(false); host.Visibility = Visibility.Hidden; selected ??= id; }
+        await Refresh(); Log("浏览器已嵌入工作台，可直接输入和操作。"); SaveSnapshot();
+        } finally { launching.Remove(id); RenderAccounts(); RenderTabs(); UpdateBrowserPresentation(); }
     }
     void Select(string id)
     {
-        proxyPageVisible = false;
+        currentPage = "环境工作台";
         proxyWorkspace.Visibility = Visibility.Collapsed;
+        diagnosticsWorkspace.Visibility = Visibility.Collapsed;
+        accountWorkspace.Visibility = Visibility.Collapsed;
+        loginAccountsWorkspace.Visibility = Visibility.Collapsed;
+        profileSettingsWorkspace.Visibility = Visibility.Collapsed;
         environmentWorkspace.Visibility = Visibility.Visible;
         UpdateNavigation();
         selected = id;
@@ -282,23 +300,43 @@ public sealed partial class MainWindow : Window
             viewport.UpdateLayout();
             active.ShowBrowser(true);
         }
-        RenderAccounts(); RenderTabs();
+        RenderAccounts(); RenderTabs(); UpdateBrowserPresentation();
         if (profiles.TryGetValue(id, out var p)) address.Text = Str(p, "url", Str(p, "startUrl"));
         SaveSnapshot();
     }
     async Task Navigate() { if (selected != null) { await Api($"profiles/{selected}/navigate", new { url = address.Text.Trim() }); await Refresh(); } }
     async Task CloseProfile(string id)
     {
-        if (hosts.Remove(id, out var host)) { host.Detach(); viewport.Children.Remove(host); host.Dispose(); }
-        await Api($"profiles/{id}/close", new { });
-        if (selected == id) selected = null;
-        if (hosts.Count > 0) Select(hosts.Keys.First()); await Refresh(); Log("浏览器已关闭，环境和登录状态保留。");
+        if (closing || launching.Contains(id) || !closingProfiles.Add(id)) return;
+        RenderAccounts(); RenderTabs(); UpdateBrowserPresentation();
+        hosts.TryGetValue(id, out var host);
+        try {
+            host?.ShowBrowser(false);
+            // Close while still embedded; only dispose the native host after
+            // the worker confirms the owned browser process has exited.
+            await Api($"profiles/{id}/close", new { });
+            if (hosts.Remove(id, out var removed)) {
+                removed.Detach(showStandalone: false); viewport.Children.Remove(removed); removed.Dispose();
+            }
+            if (selected == id) {
+                selected = null;
+                if (hosts.Count > 0 && !closing) {
+                    if (currentPage == "环境工作台") Select(hosts.Keys.First());
+                    else selected = hosts.Keys.First();
+                }
+            }
+            await Refresh(); Log("浏览器已关闭，环境和登录状态保留。");
+        } catch {
+            if (!closing && currentPage == "环境工作台" && selected == id) host?.ShowBrowser(true);
+            throw;
+        } finally { closingProfiles.Remove(id); RenderAccounts(); RenderTabs(); UpdateRuntimeCounts(); UpdateBrowserPresentation(); }
     }
     void ToggleExternal()
     {
-        if (selected == null || !hosts.TryGetValue(selected, out var host)) return;
+        if (closing || selected == null || closingProfiles.Contains(selected) || launching.Contains(selected)) return;
+        if (!hosts.TryGetValue(selected, out var host)) { var id = selected; _ = Guard(() => Launch(id)); return; }
         var hwnd = host.AttachedHandle; host.Detach(); viewport.Children.Remove(host); host.Dispose(); hosts.Remove(selected);
-        selected = null; RenderTabs(); RenderAccounts(); Log("已恢复独立浏览器窗口，点击账号“打开”可再次嵌入。"); SaveSnapshot();
+        RenderTabs(); RenderAccounts(); UpdateBrowserPresentation(); Log("浏览器继续在独立窗口运行，可切到窗口或嵌回工作台。"); SaveSnapshot();
     }
     async Task Guard(Func<Task> action) { try { await action(); } catch (Exception e) { Log(e.Message); MessageBox.Show(this, e.Message, "操作未完成", MessageBoxButton.OK, MessageBoxImage.Warning); } }
     void Log(string message) {
@@ -309,103 +347,9 @@ public sealed partial class MainWindow : Window
         messages.Add(DateTime.Now.ToString("HH:mm:ss") + " " + message);
         if (messages.Count > 200) messages.RemoveAt(0);
         File.AppendAllText(Path.Combine(localDir, "desktop.log"), messages[^1] + Environment.NewLine, Encoding.UTF8);
-    }
-    void ShowDiagnostics() {
-        var box = new TextBox { Text = string.Join(Environment.NewLine, messages), IsReadOnly = true, TextWrapping = TextWrapping.Wrap,
-            Background = Bg, Foreground = Text, FontFamily = new FontFamily("Consolas"), Padding = new Thickness(16), VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-        var window = new Window { Owner = this, Title = "运行诊断", Width = 800, Height = 450, Content = box, Background = Bg, WindowStartupLocation = WindowStartupLocation.CenterOwner }; WorkbenchTheme.Apply(window); window.ShowDialog();
+        UpdateDiagnostics();
     }
 
-    async void EditProfile(string? id)
-    {
-        try { await LoadProxyCatalog(); CreateProfileDialog(id).ShowDialog(); }
-        catch (Exception ex) { Log("环境编辑器打开失败：" + ex.Message); MessageBox.Show(this, ex.Message, "无法打开配置", MessageBoxButton.OK, MessageBoxImage.Warning); }
-    }
-    Window CreateProfileDialog(string? id)
-    {
-        JsonElement p = id != null && profiles.TryGetValue(id, out var existing) ? existing : default;
-        string Read(string key, string fallback) => p.ValueKind == JsonValueKind.Object ? Str(p, key, fallback) : fallback;
-        var dialog = new Window { Owner = this, Title = id == null ? "新建浏览器环境" : "环境配置", Width = 820, Height = 790, MinWidth = 710, MinHeight = 600,
-            Background = Bg, Foreground = Text, WindowStartupLocation = WindowStartupLocation.CenterOwner }; WorkbenchTheme.Apply(dialog);
-        var layout = new DockPanel(); var heading = new StackPanel { Margin = new Thickness(28, 22, 28, 18) };
-        heading.Children.Add(new TextBlock { Text = id == null ? "创建独立浏览器环境" : Read("name", "环境配置"), FontSize = 23, FontWeight = FontWeights.SemiBold, Foreground = Text });
-        heading.Children.Add(new TextBlock { Text = "代理、登录状态和指纹设置分别保存在此环境中。修改后重新打开浏览器生效。", Foreground = Muted, FontSize = 12, Margin = new Thickness(0, 7, 0, 0), TextWrapping = TextWrapping.Wrap });
-        DockPanel.SetDock(heading, Dock.Top); layout.Children.Add(heading);
-        var footer = new DockPanel { Margin = new Thickness(28, 14, 28, 20) }; DockPanel.SetDock(footer, Dock.Bottom); layout.Children.Add(footer);
-        var stack = new StackPanel { Margin = new Thickness(28, 0, 28, 0) }; layout.Children.Add(new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
-        var inputs = new Dictionary<string, TextBox>();
-        StackPanel Section(string title, string subtitle) {
-            var section = new StackPanel(); section.Children.Add(new TextBlock { Text = title, FontSize = 15, FontWeight = FontWeights.SemiBold, Foreground = Text, Margin = new Thickness(0, 0, 0, 5) });
-            section.Children.Add(new TextBlock { Text = subtitle, FontSize = 11, Foreground = Muted, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 16) });
-            stack.Children.Add(new Border { Child = section, Background = Panel, BorderBrush = Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(10), Padding = new Thickness(18), Margin = new Thickness(0, 0, 0, 14) }); return section;
-        }
-        TextBox Field(Panel parent, string key, string label, string fallback = "", string? hint = null) {
-            var wrapper = new StackPanel { Margin = new Thickness(0, 0, 0, 12) }; wrapper.Children.Add(Label(label, 12));
-            var input = new TextBox { Text = Read(key, fallback), Margin = new Thickness(0, 5, 0, 0) }; System.Windows.Automation.AutomationProperties.SetName(input, label); inputs[key] = input; wrapper.Children.Add(input);
-            if (hint != null) wrapper.Children.Add(new TextBlock { Text = hint, Foreground = Muted, FontSize = 10, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 5, 0, 0) }); parent.Children.Add(wrapper); return input;
-        }
-        Grid Pair(Panel parent) { var grid = new Grid(); grid.ColumnDefinitions.Add(new ColumnDefinition()); grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) }); grid.ColumnDefinitions.Add(new ColumnDefinition()); parent.Children.Add(grid); return grid; }
-        void PairFields(Panel parent, (string key, string title, string value) left, (string key, string title, string value) right) {
-            var grid = Pair(parent); var a = new StackPanel(); var b = new StackPanel(); Grid.SetColumn(b, 2); grid.Children.Add(a); grid.Children.Add(b); Field(a, left.key, left.title, left.value); Field(b, right.key, right.title, right.value);
-        }
-        var basic = Section("基本信息", "为每个账号保留独立的浏览器数据与登录状态。");
-        Field(basic, "name", "环境名称", "新环境"); Field(basic, "startUrl", "启动网址", "https://www.dola.com/");
-        PairFields(basic, ("screenWidth", "初始窗口宽度", "1280"), ("screenHeight", "初始窗口高度", "800"));
-        var proxy = Section("网络代理", "从代理库选择线路；住宅代理经上游连接。多个环境可复用配置，各自保存浏览器数据。");
-        var picker = new ComboBox { MinHeight = 38, Margin = new Thickness(0, 0, 0, 10), Padding = new Thickness(8), DisplayMemberPath = "Label", SelectedValuePath = "Id" }; System.Windows.Automation.AutomationProperties.SetName(picker, "环境代理选择"); proxy.Children.Add(picker);
-        var routeHint = new TextBlock { Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10) }; proxy.Children.Add(routeHint);
-        var legacy = new StackPanel(); proxy.Children.Add(legacy);
-        bool hasLegacy = Read("proxy", "").Length > 0 && Read("proxyId", "").Length == 0;
-        void FillPicker(string chosen) {
-            var choices = new List<ProxyChoice> { new("", "本机直连") };
-            choices.AddRange(proxyCatalog.Select(item => new ProxyChoice(Str(item, "id"), Str(item, "name") + (Str(item, "kind") == "residential" ? "  ·  住宅 / 经上游" : "  ·  普通代理"))));
-            if (hasLegacy) choices.Add(new("__legacy", "现有手动代理（兼容配置）"));
-            if (chosen.Length > 0 && choices.All(item => item.Id != chosen)) choices.Add(new(chosen, "当前代理不可用，请重新选择"));
-            picker.ItemsSource = choices; picker.SelectedValue = chosen;
-        }
-        picker.SelectionChanged += (_, _) => { var chosen = picker.SelectedValue as string ?? ""; legacy.Visibility = chosen == "__legacy" ? Visibility.Visible : Visibility.Collapsed; routeHint.Text = chosen == "" ? "本机 → 网站" : chosen == "__legacy" ? "保留已有手动代理；可在代理管理中建立可复用线路。" : CatalogRoute(chosen); };
-        FillPicker(hasLegacy ? "__legacy" : Read("proxyId", ""));
-        var manage = IconButton("settings", "管理代理 / 新建线路", async () => { await ShowProxyManager(dialog); var chosen = picker.SelectedValue as string ?? ""; try { await LoadProxyCatalog(); FillPicker(chosen); } catch (Exception ex) { routeHint.Text = ex.Message; } }); manage.HorizontalAlignment = HorizontalAlignment.Left; manage.Margin = new Thickness(0, 0, 0, 14); proxy.Children.Insert(2, manage);
-        Field(legacy, "proxy", "代理地址", "", "支持 HTTP、HTTPS 和 SOCKS5；认证信息与地址分别保存。");
-        var credentials = Pair(legacy); var userColumn = new StackPanel(); var passwordColumn = new StackPanel(); Grid.SetColumn(passwordColumn, 2); credentials.Children.Add(userColumn); credentials.Children.Add(passwordColumn);
-        Field(userColumn, "proxyUsername", "用户名（可选）"); passwordColumn.Children.Add(Label("密码（可选）", 12));
-        var password = new PasswordBox { Margin = new Thickness(0, 5, 0, 0) }; System.Windows.Automation.AutomationProperties.SetName(password, "代理密码"); passwordColumn.Children.Add(password);
-        bool hasSavedPassword = Read("proxyPasswordSet", "false").Equals("true", StringComparison.OrdinalIgnoreCase);
-        passwordColumn.Children.Add(new TextBlock { Text = hasSavedPassword ? "已保存密码；留空保留原密码" : "密码保存在本机环境配置", Foreground = Muted, FontSize = 10, Margin = new Thickness(0, 5, 0, 0) });
-        var clearPassword = new CheckBox { Content = "清除已保存的代理密码", Foreground = Muted, Margin = new Thickness(0, 10, 0, 10), Visibility = hasSavedPassword ? Visibility.Visible : Visibility.Collapsed }; legacy.Children.Add(clearPassword);
-        clearPassword.Checked += (_, _) => password.IsEnabled = false; clearPassword.Unchecked += (_, _) => password.IsEnabled = true;
-        var proxyResult = new TextBlock { Text = "尚未检测网络", Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 0) };
-        Dictionary<string, object?> ProxyDraft() {
-            var choice = picker.SelectedValue as string ?? "";
-            if (choice != "__legacy") return new() { ["proxyId"] = choice, ["proxy"] = "", ["proxyUsername"] = "", ["clearProxyPassword"] = true };
-            var draft = new Dictionary<string, object?> { ["proxyId"] = "", ["proxy"] = inputs["proxy"].Text.Trim(), ["proxyUsername"] = inputs["proxyUsername"].Text.Trim() }; if (password.Password.Length > 0 && clearPassword.IsChecked != true) draft["proxyPassword"] = password.Password; if (clearPassword.IsChecked == true) draft["clearProxyPassword"] = true; return draft;
-        }
-        Button? proxyTest = null; proxyTest = IconButton("shield", "检测连接与出口 IP", async () => {
-            proxyTest!.IsEnabled = false;
-            proxyResult.Text = "正在通过所选网络检测出口 IP…"; proxyResult.Foreground = Muted;
-            try { var draft = ProxyDraft(); var manual = (picker.SelectedValue as string) == "__legacy"; var useSaved = manual && id != null && hasSavedPassword && password.Password.Length == 0 && clearPassword.IsChecked != true && inputs["proxy"].Text.Trim() == Read("proxy", "") && inputs["proxyUsername"].Text.Trim() == Read("proxyUsername", "");
-                if (manual && !useSaved && hasSavedPassword && password.Password.Length == 0 && clearPassword.IsChecked != true) { draft["id"] = id; draft["keepProxyPassword"] = true; }
-                var result = useSaved ? await Api($"profiles/{id}/proxy-test", new { }) : await Api("proxy/test", draft);
-                proxyResult.Text = ProxySummary(result); proxyResult.Foreground = Str(result, "reachable").Equals("true", StringComparison.OrdinalIgnoreCase) ? WorkbenchTheme.Green : Hex("#B45309");
-            } catch (Exception ex) { proxyResult.Text = ex.Message; proxyResult.Foreground = Hex("#B45309"); }
-            finally { proxyTest.IsEnabled = true; }
-        }); proxy.Children.Add(proxyTest); proxy.Children.Add(proxyResult);
-        var fingerprint = Section("浏览器指纹", "常用选项直接选择；固定种子保持每个环境的 Canvas、WebGL 与音频特征稳定。");
-        var fillFingerprint = BuildFingerprintEditor(fingerprint, Read);
-        var save = Button("保存环境", async () => {
-            try {
-                int Number(string key) => int.TryParse(inputs[key].Text, out var n) ? n : throw new InvalidOperationException("种子和窗口尺寸必须填写整数。");
-                var body = ProxyDraft(); body["id"] = id; foreach (var key in new[] { "name", "startUrl" }) body[key] = inputs[key].Text.Trim();
-                foreach (var key in new[] { "screenWidth", "screenHeight" }) body[key] = Number(key);
-                fillFingerprint(body);
-                await Api("profiles", body); dialog.Close(); await Refresh();
-            } catch (Exception e) { MessageBox.Show(dialog, e.Message, "保存失败", MessageBoxButton.OK, MessageBoxImage.Warning); }
-        }, true); DockPanel.SetDock(save, Dock.Right); footer.Children.Add(save);
-        var cancel = Button("取消", () => dialog.Close()); DockPanel.SetDock(cancel, Dock.Right); footer.Children.Add(cancel);
-        var running = Read("state", "") is "running" or "starting"; save.IsEnabled = !running;
-        footer.Children.Add(new TextBlock { Text = running ? "请先关闭此环境，再修改配置。" : "配置仅保存到本机。", Foreground = Muted, FontSize = 11, VerticalAlignment = VerticalAlignment.Center });
-        dialog.Content = layout; return dialog;
-    }
     static string ProxySummary(JsonElement result) => Str(result, "reachable").Equals("true", StringComparison.OrdinalIgnoreCase)
         ? $"连接成功  ·  出口 IP {Str(result, "egressIp", "未知")}  ·  {Str(result, "latencyMs")} ms  ·  {(Str(result, "mode") == "direct" ? "本机直连" : Str(result, "protocol").ToUpperInvariant())}"
         : "连接失败：" + Str(result, "error", "未获取到出口 IP");
@@ -434,7 +378,7 @@ public sealed partial class MainWindow : Window
                 var label = Label(Str(item, "label", Str(item, "field")), 12); label.Margin = new Thickness(12); row.Children.Add(label);
                 var expected = Str(item, "expected"); var actualValue = Str(item, "actual");
                 var values = new StackPanel { Margin = new Thickness(10) }; values.Children.Add(new TextBlock { Text = "配置  " + (expected.Length > 0 ? expected : "自动"), Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap }); values.Children.Add(new TextBlock { Text = "实际  " + (actualValue.Length > 0 ? actualValue : "未暴露"), Foreground = Text, FontFamily = new FontFamily("Cascadia Code, Consolas"), FontSize = 12, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 4, 0, 0) }); Grid.SetColumn(values, 1); row.Children.Add(values);
-                var state = Str(item, "status"); var pass = state is "pass" or "match" or "matched"; var badge = Label(pass ? "一致" : state is "auto" or "observed" or "info" ? "已读取" : state is "unsupported" or "unverified" ? "未验证" : state == "mismatch" ? "不一致" : "需检查", 11, pass ? WorkbenchTheme.Green : state == "mismatch" ? Hex("#B45309") : Muted); Grid.SetColumn(badge, 2); row.Children.Add(badge); panel.Children.Add(row);
+                var state = Str(item, "status"); var pass = state is "pass" or "match" or "matched"; var badge = Label(pass ? "一致" : state is "auto" or "observed" or "info" ? "已读取" : state is "unsupported" or "unverified" ? "未验证" : state == "mismatch" ? "不一致" : "需检查", 11, pass ? WorkbenchTheme.Green : state == "mismatch" ? Hex("#E8B578") : Muted); Grid.SetColumn(badge, 2); row.Children.Add(badge); panel.Children.Add(row);
             }
         } else panel.Children.Add(new TextBlock { Text = "浏览器尚未返回可比较的指纹结果。", Foreground = Muted });
         var actual = new Expander { Header = "完整实际环境数据", Margin = new Thickness(0, 18, 0, 0), Foreground = Muted };
@@ -498,32 +442,48 @@ public sealed partial class MainWindow : Window
         try {
             using var document = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
             var saved = document.RootElement;
-            if (saved.TryGetProperty("width", out var width)) Width = Math.Max(MinWidth, width.GetDouble());
-            if (saved.TryGetProperty("height", out var height)) Height = Math.Max(MinHeight, height.GetDouble());
+            var workArea = SystemParameters.WorkArea;
+            if (saved.TryGetProperty("width", out var width)) Width = Math.Min(workArea.Width, Math.Max(MinWidth, width.GetDouble()));
+            if (saved.TryGetProperty("height", out var height)) Height = Math.Min(workArea.Height, Math.Max(MinHeight, height.GetDouble()));
+            Left = workArea.Left + Math.Max(0, (workArea.Width - Width) / 2);
+            Top = workArea.Top + Math.Max(0, (workArea.Height - Height) / 2);
             foreach (var item in saved.GetProperty("browsers").EnumerateArray()) {
                 var id = Str(item, "id");
                 if (!profiles.ContainsKey(id)) continue;
                 try {
-                    await Launch(id);
+                    bool existingRuntime = Str(profiles[id], "state") is "running" or "starting";
+                    if (Str(item, "displayMode", "embedded") == "external") {
+                        // Restore the recorded presentation directly. Reattaching and
+                        // detaching first would unnecessarily move a live window.
+                        await Api($"profiles/{id}/launch", new { embedded = false });
+                        await Refresh();
+                    } else await LaunchQueued(id, selectBrowser: false);
                     var url = Str(item, "url");
-                    if (url.Length > 0) await Api($"profiles/{id}/navigate", new { url });
+                    // A repeated resume must not reload a live page with unsaved input.
+                    if (!existingRuntime && url.Length > 0 && profiles.TryGetValue(id, out var restored) && Str(restored, "url") != url)
+                        await Api($"profiles/{id}/navigate", new { url });
                 } catch (Exception ex) { Log("恢复环境失败：" + ex.Message); }
             }
             var active = Str(saved, "selected");
-            if (hosts.ContainsKey(active)) Select(active);
+            if (RuntimeIds().Contains(active)) Select(active);
             await Refresh();
             File.WriteAllText(Path.Combine(localDir, "resume-result.json"), JsonSerializer.Serialize(new {
-                ok = true, profiles = hosts.Count, selected
+                ok = true, profiles = RuntimeIds().Count(), selected
             }), Encoding.UTF8);
         } catch (Exception ex) { Log("恢复工作台失败：" + ex.Message); }
     }
     [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hwnd, int command);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
     void SaveSnapshot()
     {
         var snapshot = new { selected, width = ActualWidth, height = ActualHeight,
-            browsers = hosts.Select(kv => new { id = kv.Key, hwnd = kv.Value.AttachedHandle.ToInt64(), parent = GetParent(kv.Value.AttachedHandle).ToInt64(),
-                visible = kv.Value.Visibility == Visibility.Visible, hostWidth = kv.Value.ActualWidth, hostHeight = kv.Value.ActualHeight,
-                contentInsets = kv.Value.ContentInsets }).ToArray() };
+            browsers = RuntimeIds().Select(id => {
+                hosts.TryGetValue(id, out var host);
+                return new { id, displayMode = host != null ? "embedded" : "external", hwnd = host?.AttachedHandle.ToInt64() ?? 0, parent = host != null ? GetParent(host.AttachedHandle).ToInt64() : 0,
+                    visible = host?.Visibility == Visibility.Visible, hostWidth = host?.ActualWidth ?? 0, hostHeight = host?.ActualHeight ?? 0, contentInsets = host?.ContentInsets };
+            }).ToArray() };
         File.WriteAllText(Path.Combine(localDir, "ui-state.json"), JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
     }
 }

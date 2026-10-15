@@ -53,6 +53,17 @@ internal static partial class Program
         client.BaseAddress=new Uri(args[0]);
         main.Loaded += async (_,_) => {
             try {
+                if (args.Contains("--lifecycle")) { await BrowserLifecycle(main,client); exit=0; return; }
+                if (args.Contains("--browser-workspace")) { await BrowserWorkspace(main,client,output); exit=0; return; }
+                if (args.Contains("--product-flow")) { await ProductFlow(main,client,output); exit=0; return; }
+                if (args.Contains("--environment-semantics")) { await EnvironmentSemantics(main,client,output); exit=0; return; }
+                if (args.Contains("--login-accounts")) { await LoginAccounts(main,client,output); exit=0; return; }
+                if (args.Contains("--accounts")) { await Accounts(main,client,output); exit=0; return; }
+                if (args.Contains("--account-center")) { await AccountCenter(main,client,output); exit=0; return; }
+                if (args.Contains("--google-login")) { await GoogleLogin(main,client,output); exit=0; return; }
+                if (args.Contains("--session-backup")) { await SessionBackup(main,client,output); exit=0; return; }
+                if (args.Contains("--proxy-sessions")) { await ProxySessions(main,client,output); exit=0; return; }
+                if (args.Contains("--diagnostics")) { await Diagnostics(main,client,output); exit=0; return; }
                 await (Task)Method("LoadProxyCatalog").Invoke(main, null)!;
                 await (Task)Method("Launch").Invoke(main,new object[]{"ui-browser"})!;await Task.Delay(600);
                 var before=await BrowserState(client);int pid=before.GetProperty("pid").GetInt32(),port=before.GetProperty("cdpPort").GetInt32();
@@ -127,7 +138,7 @@ internal static partial class Program
                 Check("Draft test shows loading and prevents duplicate actions",!Named<Button>(editor,"保存代理").IsEnabled&&!Named<Button>(editor,"检测线路与出口信息").IsEnabled);
                 Capture(editor,Path.Combine(output,"proxy-editor-checking.png"));
                 await Wait(()=>Named<Button>(editor,"保存代理").IsEnabled);
-                Check("Draft test removes loading after completion",!Named<Border>(editor,"线路检测中").IsVisible&&Nodes<TextBlock>(editor).Any(t=>t.Text.StartsWith("连接成功")));
+                Check("Draft test removes loading after completion",!Named<Border>(editor,"线路检测中").IsVisible&&Nodes<TextBlock>(editor).Any(t=>t.Text.StartsWith("出口国家 美国")));
                 Click(editor,"保存代理");await Wait(()=>!editor.IsVisible);
                 Check("Proxy editor persisted residential upstream",(await client.GetStringAsync("proxies")).Contains("new-gateway.invalid"));
                 Click(main,"环境工作台");await Task.Delay(600);var after=await BrowserState(client);var documentAfter=await Evaluate(port,snapshot);
@@ -135,6 +146,7 @@ internal static partial class Program
                 Check("Navigation preserves browser PID",after.GetProperty("pid").GetInt32()==pid);
                 foreach(var key in new[]{"token","entry","storage"})Check("Navigation preserves document "+key,documentBefore.GetProperty(key).GetString()==documentAfter.GetProperty(key).GetString());
                 Check("Returned document is visible",documentAfter.GetProperty("visibility").GetString()=="visible");
+                await ProxyGeography(main,client,output);
                 await Fingerprints(main,client,output);exit=0;
             } catch(Exception ex) { File.WriteAllText(Path.Combine(output,"ui-error.txt"),ex.ToString()); }
             finally {

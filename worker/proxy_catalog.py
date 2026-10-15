@@ -8,6 +8,7 @@ import uuid
 
 from proxy_support import parse_proxy, ProxyError
 from proxy_diagnostics import diagnose_proxy
+from proxy_sessions import ProxySessions, session_policy, policy_key, effective_entry
 
 
 class ProxyCatalog:
@@ -28,6 +29,7 @@ class ProxyCatalog:
                     raise ValueError("Duplicate saved proxy id")
                 entry.update(revision=payload.get("revision", 1), check=payload.get("check"))
                 self.entries[entry["id"]] = entry
+        self.sessions = ProxySessions(self)
 
     def validate(self, payload):
         pid = payload.get("id") or uuid.uuid4().hex[:12]
@@ -51,10 +53,52 @@ class ProxyCatalog:
             raise self.error(400, "A proxy address is required")
         if kind == "residential" and not upstream.address:
             raise self.error(400, "Residential proxies require an upstream proxy address")
-        return {"id": pid, "name": name.strip(), "kind": kind,
+        entry = {"id": pid, "name": name.strip(), "kind": kind,
                 "proxy": terminal.address, "proxyUsername": terminal.username, "proxyPassword": terminal.password,
                 "upstreamProxy": upstream.address, "upstreamProxyUsername": upstream.username,
                 "upstreamProxyPassword": upstream.password}
+        entry.update(session_policy(dict(payload, **entry), self.error))
+        return entry
+
+    def resolve_for_profile(self, profile, *, refresh=False):
+        with self.worker.lock:
+            if not profile.get("proxyId"):
+                return copy.deepcopy(profile)
+            runtime = self.worker.runtime.get(profile["id"], {})
+            if self.worker.is_running(profile["id"]):
+                if runtime.get("proxyConfig"):
+                    return copy.deepcopy(runtime["proxyConfig"])
+                relay = runtime.get("relay")
+                if relay:
+                    config = relay.config
+                    result = copy.deepcopy(self.entry(profile["proxyId"]))
+                    result.update(proxy=config.address, proxyUsername=config.username, proxyPassword=config.password)
+                    return result
+            return self.sessions.resolve(profile, self.entry(profile["proxyId"]), refresh)
+
+    def session_info(self, profile):
+        with self.worker.lock:
+            if not profile.get("proxyId"):
+                return {"mode": "fixed", "proxyId": None, "session": None}
+            return self.sessions.info(profile, self.entry(profile["proxyId"]))
+
+    def rotate_profile_session(self, profile_id):
+        with self.worker.lock:
+            profile = self.worker.profile(profile_id)
+            if self.worker.is_running(profile_id):
+                raise self.error(409, "Close the browser before rotating its residential session")
+            if not profile.get("proxyId"):
+                raise self.error(400, "This environment has no managed residential proxy")
+            entry = self.entry(profile["proxyId"])
+            if entry.get("sessionMode") != "per_profile":
+                raise self.error(400, "Enable independent environment sessions in proxy settings first")
+            self.sessions.replace(profile, entry, "manual")
+            return self.sessions.info(profile, entry)
+
+    def diagnostic_config(self, entry):
+        # Inventory checks intentionally use a separate temporary session. They
+        # neither rotate nor pretend to measure an existing account's exit IP.
+        return parse_proxy(effective_entry(entry, uuid.uuid4().hex[:16]))
 
     def entry(self, pid):
         if pid not in self.entries:
@@ -90,7 +134,7 @@ class ProxyCatalog:
             old = self.entries.get(entry["id"])
             if old and any(p.get("proxyId") == entry["id"] and self.worker.is_running(pid) for pid, p in self.worker.profiles.items()):
                 raise self.error(409, "Close bound environments before editing this proxy")
-            same_route = bool(old and parse_proxy(old) == parse_proxy(entry))
+            same_route = bool(old and policy_key(old) == policy_key(entry))
             entry.update(revision=(old or {}).get("revision", 0) + 1,
                          check=copy.deepcopy(old.get("check")) if same_route else None)
             self.entries[entry["id"]] = entry
@@ -102,6 +146,10 @@ class ProxyCatalog:
                 else:
                     self.entries.pop(entry["id"], None)
                 raise
+            if old and not same_route:
+                for pid, profile in self.worker.profiles.items():
+                    if profile.get("proxyId") == entry["id"]:
+                        self.sessions.invalidate(pid)
             return self.public(entry)
 
     def delete(self, pid):
@@ -122,16 +170,18 @@ class ProxyCatalog:
     def draft_test(self, payload):
         with self.worker.lock:
             draft = self.merge(payload)
-            config = parse_proxy(draft)
+            config = self.diagnostic_config(draft)
             saved = self.entries.get(draft["id"])
             revision = saved["revision"] if saved else None
         result = diagnose_proxy(config)
+        if draft.get("sessionMode") == "per_profile":
+            result = dict(result, sessionScope="temporary")
         with self.worker.lock:
             current = self.entries.get(draft["id"])
             # Only the exact saved route may receive an editor's check result.
             # Unsaved changes never replace diagnostics for a different route.
             if (not self.closed and current and current["revision"] == revision
-                    and parse_proxy(current) == config and draft["id"] not in self.inflight):
+                    and policy_key(current) == policy_key(draft) and draft["id"] not in self.inflight):
                 previous = current.get("check")
                 current["check"] = copy.deepcopy(result)
                 try:
@@ -198,7 +248,10 @@ class ProxyCatalog:
                     return {"cancelled": True}
                 job["items"][entry["id"]] = "running"
             try:
-                return diagnose_proxy(parse_proxy(entry))
+                result = diagnose_proxy(self.diagnostic_config(entry))
+                if entry.get("sessionMode") == "per_profile":
+                    result = dict(result, sessionScope="temporary")
+                return result
             except Exception:
                 return {"reachable": False, "error": "Proxy diagnostics failed", "qualityScore": None, "qualityComplete": False}
         try:

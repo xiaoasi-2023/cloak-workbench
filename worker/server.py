@@ -21,9 +21,15 @@ import uuid
 
 from websockets.sync.client import connect
 from websockets.protocol import State
-from proxy_support import ProxyError, ProxyRelay, parse_proxy, test_proxy
+from proxy_support import ProxyError, ProxyRelay, parse_proxy
 from fingerprint import validate_fingerprint, launch_args, capabilities, inspect_environment, require_supported
 from proxy_catalog import ProxyCatalog
+from proxy_diagnostics import diagnose_proxy
+from account_status import OBSERVE_PAGE, classify_observation, checked_result, validate_account
+from account_management import AccountManagement, now
+from google_login import GoogleLoginManager
+from login_accounts import LoginAccounts
+from session_backup import SessionBackups, MAX_BYTES
 
 
 class ApiError(Exception):
@@ -55,6 +61,9 @@ def validate_proxy(value: object) -> str:
 
 
 def validate_profile(payload: dict) -> dict:
+    login_account_id = payload.get('loginAccountId', '')
+    if not isinstance(login_account_id, str) or login_account_id and not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', login_account_id):
+        raise ApiError(400, 'Invalid login account id')
     proxy_id = payload.get("proxyId", "")
     if not isinstance(proxy_id, str) or proxy_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", proxy_id):
         raise ApiError(400, "Invalid proxy id")
@@ -73,6 +82,9 @@ def validate_profile(payload: dict) -> dict:
     if not isinstance(locale, str) or not re.fullmatch(r"[a-zA-Z]{2,3}(?:-[a-zA-Z0-9]{2,8})*", locale):
         raise ApiError(400, "Invalid locale")
     timezone = payload.get("timezone", "Asia/Shanghai")
+    region_mode = payload.get("regionMode", "proxy")
+    if region_mode not in ("proxy", "manual"):
+        raise ApiError(400, "Invalid region selection mode")
     if not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+/-]{1,80}", timezone):
         raise ApiError(400, "Invalid timezone")
     # Windows Python often lacks tzdata. The installed runtime provides this dependency.
@@ -87,11 +99,16 @@ def validate_profile(payload: dict) -> dict:
     width, height = payload.get("screenWidth", 1280), payload.get("screenHeight", 900)
     if any(isinstance(n, bool) or not isinstance(n, int) for n in (width, height)) or not 640 <= width <= 7680 or not 480 <= height <= 4320:
         raise ApiError(400, "Initial window dimensions are outside supported bounds")
-    return {"id": profile_id, "name": name.strip(), "proxyId": proxy_id, "proxy": proxy.address,
+    timestamps = {}
+    for key in ('createdAt', 'lastUsedAt'):
+        value = payload.get(key)
+        if isinstance(value, str) and len(value) <= 64:
+            timestamps[key] = value
+    return {"id": profile_id, "name": name.strip(), "loginAccountId": login_account_id, "proxyId": proxy_id, "proxy": proxy.address,
             "proxyUsername": proxy.username, "proxyPassword": proxy.password,
-            "locale": locale, "timezone": timezone, "seed": seed,
+            "locale": locale, "timezone": timezone, "seed": seed, "regionMode": region_mode,
             "startUrl": validate_url(payload.get("startUrl", "https://www.dola.com/")),
-            "screenWidth": width, "screenHeight": height, **fingerprint}
+            "screenWidth": width, "screenHeight": height, **fingerprint, **validate_account(payload, ApiError), **timestamps}
 
 
 class BrowserWorker:
@@ -102,6 +119,7 @@ class BrowserWorker:
         self.lock = threading.RLock()
         self.opener = build_opener(ProxyHandler({}))
         self.runtime: dict[str, dict] = {}
+        self.account_checks: dict[str, dict] = {}
         self.profiles: dict[str, dict] = {}
         self.catalog = ProxyCatalog(self, ApiError)
         if self.profile_file.exists():
@@ -114,6 +132,10 @@ class BrowserWorker:
             for profile in self.profiles.values():
                 if profile.get("proxyId"):
                     self.catalog.entry(profile["proxyId"])
+        self.accounts = AccountManagement(self, ApiError, validate_profile)
+        self.google_login = GoogleLoginManager(self, ApiError)
+        self.login_accounts = LoginAccounts(self, ApiError)
+        self.session_backups = SessionBackups(self, ApiError)
 
     def save(self):
         temp = self.profile_file.with_suffix(".json.tmp")
@@ -129,6 +151,9 @@ class BrowserWorker:
             if payload.get("keepProxyPassword") is True and existing:
                 merged["proxyPassword"] = existing.get("proxyPassword", "")
             profile = validate_profile(merged)
+            self.login_accounts.validate_binding(profile['id'], profile['loginAccountId'])
+            if not existing:
+                profile['createdAt'] = now()
             if profile["proxyId"]:
                 self.catalog.entry(profile["proxyId"])
             if existing and self.state(profile["id"])["state"] in ("running", "starting"):
@@ -144,6 +169,8 @@ class BrowserWorker:
                 else:
                     self.profiles.pop(profile["id"])
                 raise
+            if existing and any(existing.get(k) != profile.get(k) for k in ('proxyId', 'proxy', 'proxyUsername', 'proxyPassword')):
+                self.accounts.invalidate_proxy(profile['id'])
             return self.state(profile["id"])
 
     def profile(self, profile_id):
@@ -151,13 +178,64 @@ class BrowserWorker:
             raise ApiError(404, "Unknown profile")
         return self.profiles[profile_id]
 
+    def update_account(self, profile_id, payload):
+        """Account labels may be edited while its browser remains open."""
+        with self.lock:
+            old = self.profile(profile_id)
+            merged = dict(old)
+            merged.update(validate_account(dict(old, **payload), ApiError))
+            if 'name' in payload:
+                name = payload['name']
+                if not isinstance(name, str) or not name.strip() or len(name) > 120:
+                    raise ApiError(400, 'Name must contain 1 to 120 characters')
+                merged['name'] = name.strip()
+            self.profiles[profile_id] = merged
+            try:
+                self.save()
+            except Exception:
+                self.profiles[profile_id] = old
+                raise
+            return self.state(profile_id)
+
+    def check_account(self, profile_id, cancel=None):
+        with self.lock:
+            self.profile(profile_id)
+            generation = self.accounts.generations.get(profile_id, 0)
+            if self.accounts.closed or cancel is not None and cancel.is_set():
+                return dict(checked_result('unknown', 'check_cancelled'), source='dola_visible_page')
+            runtime = self.runtime.get(profile_id)
+            if not runtime or runtime['process'].poll() is not None:
+                result = checked_result('unknown', 'browser_closed')
+                result['source'] = 'dola_visible_page'
+                self.accounts.record_check(profile_id, 'account', result)
+                self.account_checks[profile_id] = result
+                return result
+        # CDP observation must not hold the global lock and block other accounts.
+        response = self.command(runtime, 'Runtime.evaluate', {'expression': OBSERVE_PAGE, 'returnByValue': True})
+        observation = response.get('result', {}).get('value')
+        if not isinstance(observation, dict):
+            raise ApiError(502, 'Page did not return account status')
+        result = checked_result(*classify_observation(observation))
+        with self.lock:
+            if (self.runtime.get(profile_id) is not runtime or runtime['process'].poll() is not None
+                    or self.accounts.generations.get(profile_id, 0) != generation
+                    or self.accounts.closed
+                    or cancel is not None and cancel.is_set()):
+                return dict(checked_result('unknown', 'session_changed'), source='dola_visible_page')
+            result['source'] = 'dola_visible_page'
+            self.accounts.record_check(profile_id, 'account', result)
+            self.account_checks[profile_id] = result
+        if result['status'] == 'logged_in':
+            self.session_backups.after_login(profile_id)
+        return result
+
     def is_running(self, profile_id):
         runtime = self.runtime.get(profile_id)
         return bool(runtime and runtime["process"].poll() is None)
 
-    def effective_proxy(self, profile):
+    def effective_proxy(self, profile, refresh=False):
         proxy_id = profile.get("proxyId", "")
-        return dict(self.catalog.entry(proxy_id)) if proxy_id else dict(profile)
+        return self.catalog.resolve_for_profile(profile, refresh=refresh) if proxy_id else dict(profile)
 
     def cdp_json(self, port, path):
         with self.opener.open(f"http://127.0.0.1:{port}{path}", timeout=1.5) as response:
@@ -203,6 +281,14 @@ class BrowserWorker:
         result = dict(public, state="running" if running else "closed", pid=rt["process"].pid if running else None,
                       windowHandle=find_window(rt["process"].pid) if running else 0,
                       cdpPort=rt["cdpPort"] if running else None, url=profile["startUrl"], title=profile["name"])
+        result['accountCheck'] = self.account_checks.get(profile_id, {'status': 'unknown', 'reason': 'not_checked'})
+        if hasattr(self, 'login_accounts'):
+            bound = self.login_accounts.bound(profile_id)
+            result['loginAccount'] = self.login_accounts.public(bound) if bound else None
+        if hasattr(self, 'accounts'):
+            result.update(self.accounts.summary(profile_id))
+        if hasattr(self.catalog, 'session_info'):
+            result['proxySession'] = self.catalog.session_info(profile)
         if running:
             try:
                 page = self.target(rt)
@@ -215,7 +301,7 @@ class BrowserWorker:
             self.runtime.pop(profile_id, None)
         return result
 
-    def launch(self, profile_id):
+    def launch(self, profile_id, embedded=False):
         with self.lock:
             profile = self.profile(profile_id)
             current = self.state(profile_id)
@@ -245,17 +331,18 @@ class BrowserWorker:
             except OSError:
                 lease.close()
                 raise ApiError(409, "Profile is locked by another worker")
+            restore_session = self.session_backups.prepare_startup(profile)
             args = [str(self.binary), f"--user-data-dir={profile_dir}", "--remote-debugging-address=127.0.0.1",
                     "--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check",
                     f"--fingerprint={profile['seed']}",
                     f"--lang={profile['locale']}", f"--fingerprint-locale={profile['locale']}",
                     f"--fingerprint-timezone={profile['timezone']}", "--ignore-gpu-blocklist",
                     f"--window-size={profile['screenWidth']},{profile['screenHeight']}",
-                    f"--app={profile['startUrl']}"]
+                    "--app=about:blank" if restore_session else f"--app={profile['startUrl']}"]
             args.extend(launch_args(profile))
             relay = None
             try:
-                proxy = self.effective_proxy(profile)
+                proxy = self.effective_proxy(profile, refresh=True)
                 if proxy["proxy"]:
                     relay = ProxyRelay(parse_proxy(proxy))
                     args.append(f"--proxy-server={relay.address}")
@@ -271,7 +358,15 @@ class BrowserWorker:
             try:
                 active_file.unlink(missing_ok=True)
                 log = (profile_dir / "browser.log").open("ab")
-                process = subprocess.Popen(args, stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+                startup = {}
+                if embedded and os.name == "nt":
+                    # Create the native window hidden until the desktop reparents
+                    # it. --start-minimized still briefly shows an external window.
+                    info = subprocess.STARTUPINFO()
+                    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    info.wShowWindow = 0  # SW_HIDE
+                    startup["startupinfo"] = info
+                process = subprocess.Popen(args, stdout=log, stderr=log, stdin=subprocess.DEVNULL, **startup)
             except Exception:
                 lease.close()
                 if log:
@@ -279,8 +374,20 @@ class BrowserWorker:
                 if relay:
                     relay.close()
                 raise
-            rt = {"process": process, "lease": lease, "log": log, "cdpPort": 0, "job": create_job(process), "relay": relay}
+            rt = {"process": process, "lease": lease, "log": log, "cdpPort": 0, "job": create_job(process), "relay": relay,
+                  "proxyConfig": dict(proxy)}
             self.runtime[profile_id] = rt
+            previous_last_used = profile.get('lastUsedAt')
+            profile['lastUsedAt'] = now()
+            try:
+                self.save()
+            except Exception:
+                if previous_last_used:
+                    profile['lastUsedAt'] = previous_last_used
+                else:
+                    profile.pop('lastUsedAt', None)
+                self.close(profile_id)
+                raise
             deadline = time.monotonic() + 18
             while time.monotonic() < deadline:
                 if process.poll() is not None:
@@ -295,6 +402,9 @@ class BrowserWorker:
                     rt["cdpPort"] = port
                     self.target(rt)
                     self.configure_downloads(profile_id, rt)
+                    if restore_session:
+                        self.session_backups.restore_startup(profile_id, rt)
+                        self.navigate(profile_id, {'url':profile['startUrl']})
                     return self.state(profile_id)
                 except (OSError, ValueError, IndexError, ApiError):
                     time.sleep(.15)
@@ -318,9 +428,15 @@ class BrowserWorker:
         rt["log"].close()
 
     def proxy_test(self, payload=None, profile_id=None):
+        catalog_id = None
+        generation = None
         with self.lock:
             if profile_id is not None:
-                payload = self.effective_proxy(self.profile(profile_id))
+                profile = self.profile(profile_id)
+                catalog_id = profile.get("proxyId") or None
+                payload = self.effective_proxy(profile, refresh=True)
+                generation = self.accounts.generations.get(profile_id, 0)
+                catalog_id = None  # A profile must test its own sticky session, not a gateway draft.
             else:
                 payload = dict(payload or {})
                 # An editor can test a saved secret without ever reading it.
@@ -332,12 +448,22 @@ class BrowserWorker:
                 if payload.get("proxyId"):
                     if not isinstance(payload["proxyId"], str):
                         raise ApiError(400, "Invalid proxy id")
-                    payload = dict(self.catalog.entry(payload["proxyId"]))
+                    catalog_id = payload["proxyId"]
+                    payload = dict(self.catalog.entry(catalog_id))
+        if catalog_id:
+            return self.catalog.draft_test({"id": catalog_id})
         try:
             config = parse_proxy(payload)
         except ProxyError as exc:
             raise ApiError(400, str(exc)) from None
-        return test_proxy(config)
+        result = dict(diagnose_proxy(config))
+        if profile_id is not None:
+            with self.lock:
+                if (not self.accounts.closed and self.accounts.generations.get(profile_id, 0) == generation
+                        and parse_proxy(self.effective_proxy(self.profile(profile_id))) == config):
+                    result['source'] = 'profile_proxy_diagnostics'
+                    self.accounts.record_check(profile_id, 'network', result, config)
+        return result
 
     def download_directory(self, profile_id):
         directory = self.data_dir / "downloads" / profile_id
@@ -459,6 +585,9 @@ class BrowserWorker:
             return self.state(profile_id)
 
     def shutdown(self):
+        self.session_backups.close()
+        self.google_login.close()
+        self.accounts.close()
         self.catalog.close()
         for profile_id in list(self.runtime):
             try:
@@ -563,14 +692,26 @@ def make_handler(worker, token):
                             "proxyProtocols": ["http", "https", "socks5"], "proxyTest": True,
                             "proxyCatalog": True, "chainedProxy": True, "batchProxyDiagnostics": True, "perProfileDownloads": True}}
                 with worker.lock:
+                    if parts == ['login-accounts']:
+                        return worker.login_accounts.list()
                     if parts == ["proxies"]:
                         return {"proxies": [worker.catalog.public(p) for p in worker.catalog.entries.values()]}
                     if len(parts) == 2 and parts[0] == "proxy-checks":
                         return worker.catalog.snapshot(parts[1])
+                    if len(parts) == 2 and parts[0] == 'account-jobs':
+                        return worker.accounts.snapshot(parts[1])
                     if parts in (["profiles"], ["state"]):
                         return {"profiles": [worker.state(pid) for pid in worker.profiles]}
                     if len(parts) == 3 and parts[0] == "profiles" and parts[2] == "state":
                         return worker.state(parts[1])
+                    if len(parts) == 3 and parts[0] == 'profiles' and parts[2] == 'details':
+                        return worker.accounts.details(parts[1])
+                    if len(parts) == 3 and parts[0] == 'profiles' and parts[2] == 'google-credentials':
+                        return worker.google_login.credential_info(parts[1])
+                    if len(parts) == 3 and parts[0] == 'profiles' and parts[2] == 'google-login':
+                        return worker.google_login.snapshot(parts[1])
+                    if len(parts) == 3 and parts[0] == 'profiles' and parts[2] == 'session-backup':
+                        return worker.session_backups.info(parts[1])
                     if len(parts) == 3 and parts[0] == "profiles" and parts[2] == "downloads":
                         return worker.downloads(parts[1])
                     if len(parts) == 3 and parts[0] == "profiles" and parts[2] == "environment":
@@ -582,7 +723,8 @@ def make_handler(worker, token):
                 raise ApiError(405, "Method not allowed")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length < 0 or length > 65536:
+                limit = MAX_BYTES * 2 + 65536 if parts == ['sessions', 'preview'] else 65536
+                if length < 0 or length > limit:
                     raise ValueError()
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict):
@@ -591,6 +733,42 @@ def make_handler(worker, token):
                 raise ApiError(400, "Expected a JSON object smaller than 64 KiB")
             if parts == ["profiles"]:
                 return worker.create(payload)
+            if parts == ['login-accounts']:
+                return worker.login_accounts.upsert(payload)
+            if parts == ['login-accounts', 'migrate']:
+                return worker.login_accounts.migrate()
+            if len(parts) == 3 and parts[0] == 'login-accounts' and parts[2] == 'delete':
+                return worker.login_accounts.delete(parts[1])
+            if len(parts) == 3 and parts[0] == 'profiles' and parts[2] == 'login-account':
+                return worker.login_accounts.bind(parts[1], payload)
+            if parts == ['accounts', 'import']:
+                return worker.accounts.import_rows(payload)
+            if parts == ['sessions','preview']:
+                return worker.session_backups.preview(payload.get('text'))
+            if parts == ['sessions','import']:
+                return worker.session_backups.import_new(payload)
+            if len(parts) == 4 and parts[0] == 'profiles' and parts[2] == 'session-backup':
+                if parts[3] == 'preview':
+                    return worker.session_backups.preview_backup(parts[1])
+                if parts[3] == 'export':
+                    return worker.session_backups.export(parts[1], payload.get('format'))
+            if parts == ['accounts', 'batch']:
+                return worker.accounts.batch(payload)
+            if parts == ['accounts', 'check']:
+                return worker.accounts.start(payload)
+            if len(parts) == 3 and parts[0] == 'account-jobs' and parts[2] == 'cancel':
+                return worker.accounts.cancel(parts[1])
+            if len(parts) == 4 and parts[0] == 'profiles' and parts[2:] == ['proxy-session', 'rotate']:
+                return worker.catalog.rotate_profile_session(parts[1])
+            if len(parts) == 4 and parts[0] == 'profiles' and parts[2] == 'google-login':
+                if parts[3] == 'cancel':
+                    return worker.google_login.cancel(parts[1])
+                if parts[3] == 'verify':
+                    return worker.google_login.verify(parts[1])
+                if parts[3] == 'continue':
+                    return worker.google_login.resume(parts[1], payload)
+            if len(parts) == 4 and parts[0] == 'profiles' and parts[2:] == ['google-credentials', 'forget']:
+                return worker.google_login.forget(parts[1])
             if parts == ["proxies"]:
                 return worker.catalog.upsert(payload)
             if parts == ["proxies", "test"]:
@@ -613,9 +791,20 @@ def make_handler(worker, token):
             if len(parts) == 3 and parts[0] == "profiles":
                 profile_id, operation = parts[1:]
                 if operation == "launch":
-                    return worker.launch(profile_id)
+                    embedded = payload.get("embedded", False)
+                    if not isinstance(embedded, bool):
+                        raise ApiError(400, "embedded must be a boolean")
+                    return worker.launch(profile_id, embedded=embedded)
                 if operation == "close":
                     return worker.close(profile_id)
+                if operation == "account":
+                    return worker.update_account(profile_id, payload)
+                if operation == "account-check":
+                    return worker.check_account(profile_id)
+                if operation == 'google-login':
+                    return worker.google_login.start(profile_id, payload)
+                if operation == 'session-backup':
+                    return worker.session_backups.backup(profile_id)
                 if operation == "navigate":
                     return worker.navigate(profile_id, payload)
                 if operation == "action":

@@ -73,7 +73,7 @@ class ProxyCatalogTests(unittest.TestCase):
 
     def test_profile_draft_test_resolves_catalog_credentials(self):
         self.proxy()
-        with patch("server.test_proxy", return_value={"reachable": True}) as probe:
+        with patch("proxy_catalog.diagnose_proxy", return_value={"reachable": True}) as probe:
             self.worker.proxy_test({"proxyId": "route", "proxy": "http://wrong:80"})
         config = probe.call_args.args[0]
         self.assertEqual(config.host, "invalid.example")
@@ -236,6 +236,29 @@ class DiagnosticTests(unittest.TestCase):
         self.assertFalse(result["rotatingExit"])
         self.assertIsNone(result["metadataError"])
 
+    def test_geography_uses_the_same_exit_snapshot_and_validates_timezone(self):
+        primary = {"ip": "203.0.113.1", "isResidential": True, "fraudScore": 10,
+                   "countryCode": "US", "region": "Texas", "city": "Dallas", "timezone": "America/Chicago",
+                   "asn": 123, "asOrganization": "Fixture ISP"}
+        wrong = {"ip": "203.0.113.2", "country": "JP", "city": "Tokyo", "timezone": "Asia/Tokyo"}
+        result = self.probe([primary, wrong])
+        self.assertEqual((result["countryCode"], result["city"], result["timezone"]), ("US", "Dallas", "America/Chicago"))
+        primary["timezone"] = "Not/ARealZone"
+        result = self.probe([primary, wrong, wrong])
+        self.assertIsNone(result["timezone"])
+        self.assertEqual(result["city"], "Dallas")
+
+    def test_direct_diagnostics_do_not_use_proxy_or_system_proxy(self):
+        network = {"ip": "203.0.113.1", "country": "GB", "city": "London", "region": "England",
+                   "timezone": "Europe/London", "org": "AS123 Fixture ISP"}
+        with patch("proxy_diagnostics.ProxyRelay") as relay, patch("proxy_diagnostics.request_json", side_effect=[OSError(), network]) as requests:
+            result = diagnose_proxy(parse_proxy({}))
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["mode"], "direct")
+        self.assertEqual(result["timezone"], "Europe/London")
+        relay.assert_not_called()
+        self.assertTrue(all(call.args[0] is None for call in requests.call_args_list))
+
     def test_unavailable_risk_service_does_not_fake_score_or_break_connectivity(self):
         result = self.probe([ValueError("contains private credentials"),
                              {"ip": "203.0.113.1", "country": "US", "region": "Test", "org": "AS123 Fixture ISP"}])
@@ -315,7 +338,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(result["reachable"])
         self.assertEqual(result["snapshotSource"], "ipify")
         self.assertIsNone(result["qualityScore"])
-        self.assertEqual(timeouts, [8, 8, 8])
+        self.assertEqual(timeouts, [8, 8, 8, 8])
         self.assertLessEqual(current[0], 32)
 
     def test_all_failed_services_never_exceed_four_attempts_and_budget(self):

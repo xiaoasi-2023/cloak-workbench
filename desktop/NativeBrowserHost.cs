@@ -51,6 +51,8 @@ public sealed class NativeBrowserHost : HwndHost
     private BrowserContentInsets _contentInsets = new(0, 0, 0, 0, false);
     private uint _insetDpi;
     private int _insetAttempts;
+    private bool _insetPending;
+    private int _insetVersion;
     private int _presentationVersion;
     private DispatcherTimer? _pendingPresentation;
     private bool _needsPresentation = true;
@@ -79,12 +81,12 @@ public sealed class NativeBrowserHost : HwndHost
 
     protected override void DestroyWindowCore(HandleRef hwnd)
     {
-        Detach();
+        Detach(showStandalone: false);
         if (IsWindow(hwnd.Handle)) DestroyWindow(hwnd.Handle);
         _container = IntPtr.Zero;
     }
 
-    public void Attach(IntPtr hwnd)
+    public void Attach(IntPtr hwnd, bool showStandaloneOnDetach = false)
     {
         Dispatcher.VerifyAccess();
         if (_container == IntPtr.Zero) throw new InvalidOperationException("Wait for the browser host Loaded event before attaching.");
@@ -104,11 +106,13 @@ public sealed class NativeBrowserHost : HwndHost
             MapWindowPoints(IntPtr.Zero, actualParent, points, 2);
             rect = new NativeRect(points[0].X, points[0].Y, points[1].X, points[1].Y);
         }
-        _original = new WindowSnapshot(hwnd, parent, style, ReadWindowLong(hwnd, GwlExStyle), rect, IsWindowVisible(hwnd));
+        _original = new WindowSnapshot(hwnd, parent, style, ReadWindowLong(hwnd, GwlExStyle), rect, IsWindowVisible(hwnd) || showStandaloneOnDetach);
         OwnedWindows = new BrowserWindowManager(hwnd);
         _contentInsets = new(0, 0, 0, 0, false);
         _insetAttempts = 0;
         _insetDpi = 0;
+        _insetPending = false;
+        ++_insetVersion;
         _needsPresentation = true;
         try
         {
@@ -126,14 +130,16 @@ public sealed class NativeBrowserHost : HwndHost
         }
         catch
         {
-            Detach();
+            Detach(showStandalone: false);
             throw;
         }
     }
 
-    public void Detach()
+    public void Detach(bool showStandalone = true)
     {
         Dispatcher.VerifyAccess();
+        ++_insetVersion;
+        _insetPending = false;
         ++_presentationVersion;
         CancelPendingPresentation();
         RemoveFocusObserver();
@@ -142,7 +148,7 @@ public sealed class NativeBrowserHost : HwndHost
         _lastFocusedChild = IntPtr.Zero;
         var original = _original;
         if (original is null) return;
-        if (!IsWindowAlive(original.Handle)) { _original = null; return; }
+        if (!IsWindowAlive(original.Handle)) { _original = null; OwnedWindows = null; return; }
         // Attempt every restoration step even when an earlier one fails. Keep the
         // snapshot on failure so a later explicit Detach can retry safely.
         bool restored = true;
@@ -153,7 +159,10 @@ public sealed class NativeBrowserHost : HwndHost
         }
         ShowWindow(original.Handle, SwHide);
         RestoreStep(() => ChangeParent(original.Handle, original.Parent));
-        RestoreStep(() => WriteWindowLong(original.Handle, GwlStyle, original.Style));
+        // Restoring WS_VISIBLE itself can expose a top-level window, even if
+        // ShowWindow(SW_SHOW) is skipped. Cleanup must restore a hidden style.
+        RestoreStep(() => WriteWindowLong(original.Handle, GwlStyle,
+            showStandalone ? original.Style : new IntPtr(original.Style.ToInt64() & ~WsVisible)));
         RestoreStep(() => WriteWindowLong(original.Handle, GwlExStyle, original.ExStyle));
         RestoreStep(() =>
         {
@@ -163,7 +172,7 @@ public sealed class NativeBrowserHost : HwndHost
                 SwpNoZOrder | SwpNoActivate | SwpFrameChanged | SwpNoOwnerZOrder))
                 throw LastError("Restore browser bounds");
         });
-        if (original.WasVisible) ShowWindow(original.Handle, SwShow);
+        if (showStandalone && original.WasVisible) ShowWindow(original.Handle, SwShow);
         if (restored)
         {
             _original = null;
@@ -268,7 +277,7 @@ public sealed class NativeBrowserHost : HwndHost
             ReportLastError("Resize embedded browser");
     }
 
-    private void MeasureContentInsets()
+    private async void MeasureContentInsets()
     {
         if (!_browserShown || !IsWindowVisible(AttachedHandle)) return;
         uint dpi = GetDpiForWindow(AttachedHandle);
@@ -278,37 +287,55 @@ public sealed class NativeBrowserHost : HwndHost
             _insetAttempts = 0;
             _contentInsets = new(0, 0, 0, 0, false);
         }
-        if (_contentInsets.Measured || ++_insetAttempts > 5) return;
+        if (_contentInsets.Measured || _insetPending || ++_insetAttempts > 5) return;
+        var hwnd = AttachedHandle;
+        int version = _insetVersion;
+        _insetPending = true;
         try
         {
-            // Chromium draws its caption inside the native client area, so
-            // removing WS_CAPTION alone cannot remove it. UIA's native Views
-            // provider exposes the content container in physical screen pixels.
-            // Read only that container, never DOM text or guessed OS metrics.
-            var frame = AutomationElement.FromHandle(AttachedHandle);
-            var content = frame.FindFirst(TreeScope.Descendants,
-                new PropertyCondition(AutomationElement.ClassNameProperty, "MultiContentsView"));
-            if (content is null || !GetWindowRect(AttachedHandle, out var outer)) return;
-            var bounds = content.Current.BoundingRectangle;
-            if (bounds.IsEmpty || bounds.Width < 1 || bounds.Height < 1) return;
-            GetWindowThreadProcessId(AttachedHandle, out var pid);
-            if (content.Current.ProcessId != (int)pid) return;
-            int left = (int)Math.Round(bounds.Left - outer.Left);
-            int top = (int)Math.Round(bounds.Top - outer.Top);
-            int right = (int)Math.Round(outer.Right - bounds.Right);
-            int bottom = (int)Math.Round(outer.Bottom - bounds.Bottom);
-            double scale = Math.Max(1, dpi) / 96d;
-            if (left < 0 || right < 0 || top < 0 || bottom < 0
-                || left > 48 * scale || right > 48 * scale || bottom > 48 * scale || top > 180 * scale
-                || bounds.Width < (outer.Right - outer.Left) * .75
-                || bounds.Height < (outer.Bottom - outer.Top) * .5) return;
-            _contentInsets = new(left, top, right, bottom, true);
-            Diagnostic?.Invoke($"Native content insets measured: left {left}, top {top}, right {right}, bottom {bottom}, DPI {dpi}.");
+            // UIA crosses into Chromium and can wait for a busy provider. Never
+            // query it on the WPF thread, whose input queue is linked to Chrome.
+            var measured = await System.Threading.Tasks.Task.Run(() => ReadContentInsets(hwnd, dpi));
+            if (version != _insetVersion || AttachedHandle != hwnd || !IsWindowAlive(hwnd) || GetDpiForWindow(hwnd) != dpi) return;
+            if (measured is null) return;
+            _contentInsets = measured;
+            Diagnostic?.Invoke($"Native content insets measured: left {measured.Left}, top {measured.Top}, right {measured.Right}, bottom {measured.Bottom}, DPI {dpi}.");
+            RefreshBounds();
         }
         catch (Exception ex) when (ex is ElementNotAvailableException or InvalidOperationException or COMException)
         {
-            Diagnostic?.Invoke($"Native content bounds not yet available: {ex.GetType().Name}.");
+            if (version == _insetVersion)
+                Diagnostic?.Invoke($"Native content bounds not yet available: {ex.GetType().Name}.");
         }
+        finally { if (version == _insetVersion) _insetPending = false; }
+    }
+
+    private static BrowserContentInsets? ReadContentInsets(IntPtr hwnd, uint dpi)
+    {
+        // Chromium draws its caption inside the native client area, so
+        // removing WS_CAPTION alone cannot remove it. UIA's native Views
+        // provider exposes the content container in physical screen pixels.
+        // Read only that container, never DOM text or guessed OS metrics.
+        var frame = AutomationElement.FromHandle(hwnd);
+        var content = frame.FindFirst(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ClassNameProperty, "MultiContentsView"));
+        if (content is null || !GetWindowRect(hwnd, out var outer)) return null;
+        var bounds = content.Current.BoundingRectangle;
+        if (bounds.IsEmpty || bounds.Width < 1 || bounds.Height < 1) return null;
+        GetWindowThreadProcessId(hwnd, out var pid);
+        if (content.Current.ProcessId != (int)pid) return null;
+        if (!GetWindowRect(hwnd, out var current) || current.Left != outer.Left || current.Top != outer.Top
+            || current.Right != outer.Right || current.Bottom != outer.Bottom) return null;
+        int left = (int)Math.Round(bounds.Left - outer.Left);
+        int top = (int)Math.Round(bounds.Top - outer.Top);
+        int right = (int)Math.Round(outer.Right - bounds.Right);
+        int bottom = (int)Math.Round(outer.Bottom - bounds.Bottom);
+        double scale = Math.Max(1, dpi) / 96d;
+        if (left < 0 || right < 0 || top < 0 || bottom < 0
+            || left > 48 * scale || right > 48 * scale || bottom > 48 * scale || top > 180 * scale
+            || bounds.Width < (outer.Right - outer.Left) * .75
+            || bounds.Height < (outer.Bottom - outer.Top) * .5) return null;
+        return new(left, top, right, bottom, true);
     }
 
     protected override void OnWindowPositionChanged(Rect rcBoundingBox)
@@ -518,14 +545,14 @@ public sealed class NativeBrowserHost : HwndHost
     public static bool IsWindowAlive(IntPtr hwnd) => hwnd != IntPtr.Zero && IsWindow(hwnd);
 
     /// <summary>Read-only discovery; call again while a launched browser starts.</summary>
-    public static IntPtr FindBrowserWindow(int pid)
+    public static IntPtr FindBrowserWindow(int pid, bool includeHidden = false)
     {
         if (pid <= 0) return IntPtr.Zero;
         IntPtr found = IntPtr.Zero;
         EnumWindows((hwnd, _) =>
         {
             GetWindowThreadProcessId(hwnd, out var windowPid);
-            if (windowPid != (uint)pid || !IsWindowVisible(hwnd) || GetWindow(hwnd, GwOwner) != IntPtr.Zero) return true;
+            if (windowPid != (uint)pid || (!includeHidden && !IsWindowVisible(hwnd)) || GetWindow(hwnd, GwOwner) != IntPtr.Zero) return true;
             var className = new StringBuilder(256);
             GetClassName(hwnd, className, className.Capacity);
             if (className.ToString() != "Chrome_WidgetWin_1") return true;

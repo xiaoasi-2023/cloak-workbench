@@ -1,5 +1,6 @@
 """Fixed, bounded HTTPS diagnostics through exactly one configured relay."""
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from http.client import HTTPSConnection
 import ipaddress
 import json
@@ -31,7 +32,7 @@ def request_json(relay, endpoint, timeout=8):
             super()._tunnel()
             # HTTPSConnection next performs the verified TLS handshake.
             self.sock.settimeout(remaining())
-    connection = DeadlineConnection("127.0.0.1", relay.port, timeout=remaining())
+    connection = DeadlineConnection("127.0.0.1" if relay else target.hostname, relay.port if relay else 443, timeout=remaining())
     active_socket = []
     def abort():
         sock = active_socket[0] if active_socket else connection.sock
@@ -45,7 +46,8 @@ def request_json(relay, endpoint, timeout=8):
     timer.daemon = True
     timer.start()
     try:
-        connection.set_tunnel(target.hostname, 443)
+        if relay:
+            connection.set_tunnel(target.hostname, 443)
         connection.connect()
         active_socket.append(connection.sock)
         connection.sock.settimeout(remaining())
@@ -106,24 +108,31 @@ def network_fields(data):
         asn = "AS" + re.sub(r"^AS", "", asn, flags=re.IGNORECASE)
     else:
         asn = match.group(1).upper() if match else None
-    return {"country": short_text(data.get("countryCode")) or short_text(data.get("country")), "region": short_text(data.get("region")),
+    country = short_text(data.get("countryCode")) or short_text(data.get("country"))
+    code = country.upper() if country and re.fullmatch(r"[A-Za-z]{2}", country) else None
+    zone = short_text(data.get("timezone"))
+    if zone:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        try:
+            ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            zone = None
+    return {"country": country, "countryCode": code, "region": short_text(data.get("region")),
+            "city": short_text(data.get("city")), "timezone": zone,
             "isp": (match.group(2) or None) if match else (org or None), "asn": asn}
 
 
 def diagnose_proxy(config):
     result = {"reachable": False, "egressIp": None, "latencyMs": None,
-              "protocol": config.scheme, "mode": "chained" if getattr(config, "upstream", None) else "proxy",
-              "country": None, "region": None, "isp": None, "asn": None,
+              "protocol": config.scheme or "direct", "mode": "chained" if getattr(config, "upstream", None) else "proxy" if config.address else "direct",
+              "country": None, "countryCode": None, "region": None, "city": None, "timezone": None, "isp": None, "asn": None,
               "isResidential": None, "riskScore": None, "riskStatus": "unknown",
               "qualityScore": None, "qualityComplete": False, "sources": {},
               "checkedAt": datetime.now(timezone.utc).isoformat(), "metadataError": None,
               "error": None, "endpoint": None, "snapshotSource": None,
               "rotatingExit": False, "observations": [], "observationNote": None}
-    if not config.address:
-        result["error"] = "A configured proxy is required"
-        return result
     try:
-        with ProxyRelay(config) as relay:
+        with ProxyRelay(config) if config.address else nullcontext(None) as relay:
             deadline = time.monotonic() + 32
             def observe(endpoint, source, kind, exit_observation=True):
                 """Only self-IP responses are exit observations; lookups are metadata."""
@@ -182,7 +191,7 @@ def diagnose_proxy(config):
                             result[key] = value
 
             fill_network(network)
-            if any(result[key] is None for key in ("country", "region", "isp", "asn")) and snapshot["source"] != "ipify":
+            if any(result[key] is None for key in ("country", "region", "isp", "asn", "city", "timezone")):
                 # ip_value has already canonicalized the literal; this cannot become
                 # an arbitrary URL or leak proxy credentials into a lookup request.
                 lookup_url = "https://ipinfo.io/" + snapshot["ip"] + "/json"

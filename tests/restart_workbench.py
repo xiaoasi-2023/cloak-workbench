@@ -11,6 +11,24 @@ from urllib.parse import urlsplit
 from websockets.sync.client import connect
 
 
+def restart_snapshot(snapshot, profiles):
+    """Retain only live environments and their embedded/external presentation."""
+    reopen = []
+    seen = set()
+    for item in snapshot['browsers']:
+        profile = profiles.get(item['id'])
+        if not profile or profile['state'] not in ('running', 'starting') or profile['id'] in seen:
+            continue
+        seen.add(profile['id'])
+        reopen.append({'id': profile['id'], 'url': profile['url'],
+                       'displayMode': 'external' if item.get('displayMode') == 'external' else 'embedded'})
+    selected = snapshot.get('selected')
+    if selected not in seen:
+        selected = reopen[0]['id'] if reopen else None
+    return {'browsers': reopen, 'selected': selected,
+            'width': snapshot['width'], 'height': snapshot['height']}
+
+
 def probe_drafts(opener, profiles, saved=None):
     """Retain unsaved local test-page drafts; never inspect third-party forms."""
     drafts = {} if saved is None else saved
@@ -51,7 +69,7 @@ def probe_drafts(opener, profiles, saved=None):
     return drafts if saved is None else restored
 
 
-def main():
+def main(before_launch=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--build', action='store_true')
     args = parser.parse_args()
@@ -63,13 +81,8 @@ def main():
     req = Request('http://127.0.0.1:8766/profiles', headers={'Authorization': 'Bearer ' + session['token']})
     with opener.open(req, timeout=10) as response:
         profiles = {p['id']: p for p in json.load(response)['profiles']}
-    reopen = []
-    for item in snapshot['browsers']:
-        p = profiles.get(item['id'])
-        if p and p['state'] in ('running', 'starting'):
-            reopen.append({'id': p['id'], 'url': p['url']})
-    saved = {'browsers': reopen, 'selected': snapshot['selected'],
-             'width': snapshot['width'], 'height': snapshot['height']}
+    saved = restart_snapshot(snapshot, profiles)
+    reopen = saved['browsers']
     drafts = probe_drafts(opener, {p['id']: profiles[p['id']] for p in reopen})
     draft_file = local / 'restart-drafts.json'
     draft_file.write_text(json.dumps(drafts, ensure_ascii=False), encoding='utf-8')
@@ -116,6 +129,8 @@ def main():
         for handle in handles:
             if handle:
                 kernel.CloseHandle(handle)
+    if before_launch is not None:
+        before_launch()
     if args.build:
         subprocess.run([str(root / '.tools/dotnet/dotnet.exe'), 'build',
                         str(root / 'desktop/CloakWorkbench.csproj'), '-c', 'Release', '--nologo'], cwd=root, check=True)
@@ -127,7 +142,11 @@ def main():
         if result.exists():
             resumed = json.loads(result.read_text(encoding='utf-8-sig'))
             if not resumed['ok'] or resumed['profiles'] != len(reopen) or resumed['selected'] != saved['selected']:
-                raise RuntimeError('Not all previously embedded environments resumed')
+                raise RuntimeError('Not all previously running environments resumed')
+            restored_snapshot = json.loads((local / 'ui-state.json').read_text(encoding='utf-8-sig'))
+            modes = {p['id']: p.get('displayMode', 'embedded') for p in restored_snapshot['browsers']}
+            if any(modes.get(p['id']) != p['displayMode'] for p in reopen):
+                raise RuntimeError('Browser presentation mode was not restored')
             current = json.loads((local / 'session.json').read_text(encoding='utf-8-sig'))
             request = Request('http://127.0.0.1:8766/profiles', headers={'Authorization': 'Bearer ' + current['token']})
             with opener.open(request, timeout=10) as response:
