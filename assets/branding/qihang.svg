@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">栖航工作台 · 图标草案</title>
+  <desc id="description">深绿圆角底板，层叠的浏览器窗口和指向右上的航向标。</desc>
+  <rect x="4" y="4" width="248" height="248" rx="54" fill="#102B25"/>
+  <path d="M51 154V66a15 15 0 0 1 15-15h88" fill="none" stroke="#28D6AA" stroke-opacity=".45" stroke-width="14" stroke-linecap="round"/>
+  <rect x="77" y="77" width="128" height="128" rx="20" fill="none" stroke="#28D6AA" stroke-width="14"/>
+  <path d="m111 155 60-54-15 72-18-27Z" fill="#28D6AA"/>
+</svg>

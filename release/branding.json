@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "status": "draft-not-connected-to-application",
+  "productId": "qihang-workbench",
+  "displayName": "栖航工作台",
+  "englishName": "Qihang Workbench",
+  "tagline": "账号、环境与任务，井然有序。",
+  "description": "Windows 多账号与浏览器环境工作台",
+  "version": "0.1.0-beta.1",
+  "fileVersion": "0.1.0.0",
+  "channel": "beta",
+  "author": "Qihang Studio",
+  "authorIsPlaceholder": true,
+  "copyright": "Copyright © 2026 Qihang Studio",
+  "homepage": "https://github.com/xiaoasi-2023/cloak-workbench",
+  "issueTracker": "https://github.com/xiaoasi-2023/cloak-workbench/issues",
+  "contact": {
+    "email": "",
+    "wechat": "",
+    "qq": "",
+    "emptyDisplayText": "暂未设置"
+  },
+  "icon": "assets/branding/qihang.ico",
+  "logoSource": "assets/branding/qihang.svg",
+  "colors": {
+    "accent": "#28D6AA",
+    "background": "#102B25",
+    "text": "#E7ECE9"
+  },
+  "recommendedEngine": {
+    "provider": "CloakBrowser",
+    "version": "146.0.7680.177.5",
+    "platform": "win-x64",
+    "automaticUpgrade": false,
+    "redistributionAuthorized": false
+  }
+}
