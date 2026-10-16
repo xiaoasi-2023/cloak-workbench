@@ -27,6 +27,8 @@ public sealed partial class MainWindow
         internal bool Loading, Starting, Active;
         internal string LastJobVersion = "";
         internal string Stage = "";
+        internal string State = "idle";
+        internal bool Dismissed;
     }
 
     async void ShowGoogleLogin(string id)
@@ -44,6 +46,7 @@ public sealed partial class MainWindow
                 if (existing.Panel.Parent is Panel old) old.Children.Remove(existing.Panel);
                 container.Children.Add(existing.Panel);
                 AttachGoogleLoginFooter(container, existing.Footer);
+                ((ScrollViewer)container.Parent).SizeChanged += (_, _) => RevealGoogleAge(existing);
                 await ReloadGoogleCredentials(id, existing);
                 await PollGoogleLogin(); return;
             }
@@ -76,31 +79,18 @@ public sealed partial class MainWindow
             var actions = new Grid(); actions.ColumnDefinitions.Add(new ColumnDefinition()); actions.ColumnDefinitions.Add(new ColumnDefinition()); footer.Children.Add(actions);
             var start = Button("开始登录", async () => await StartGoogleLogin(id, view!), true); start.Height = 38; start.Margin = new Thickness(0, 0, 6, 0); AutomationProperties.SetName(start, "开始 Google 登录"); actions.Children.Add(start);
             var open = Button("手动接管", async () => { try { await Launch(id); } catch { view!.Status.Text = "浏览器打开失败，请查看运行诊断。"; } }); open.Height = 38; open.Margin = new Thickness(6, 0, 0, 0); AutomationProperties.SetName(open, "打开浏览器 / 手动接管"); Grid.SetColumn(open, 1); actions.Children.Add(open);
-            var verify = Button("已手动完成，验证 Dola 登录", async () => {
-                view!.Verify.IsEnabled = false;
-                try { var result = await Api($"profiles/{id}/google-login/verify", new { }); view.Status.Text = Str(result, "confirmed").Equals("true", StringComparison.OrdinalIgnoreCase) ? "已确认 Dola 登录，会话已保存。" : "Dola 登录尚未确认，请完成浏览器中的验证后重试。"; await Refresh(); }
-                catch { view.Status.Text = "登录结果暂时无法读取，请稍后重试。"; }
-                finally { view.Verify.IsEnabled = !view.Active; }
-            }); verify.Content = "检测 Dola 登录"; AutomationProperties.SetName(verify, "已手动完成，验证 Dola 登录"); verify.Margin = new Thickness(6, 8, 0, 0); verify.Visibility = Visibility.Collapsed;
-            var next = Button("继续登录流程", async () => {
-                view!.Starting = true; SetGoogleLoginControls(view, true); view.Status.Text = "正在继续当前页面的新账号步骤…";
-                try { var result = await Api($"profiles/{id}/google-login/continue", new { allowOnboarding = view.Onboarding.IsChecked == true, ageConfirmed = view.AgeConfirmed.IsChecked == true }); UpdateGoogleLoginView(view, result); view.AgeConfirmed.IsChecked = false; }
-                catch { view.Status.Text = "当前任务无法继续。请确认原浏览器仍打开；若页面需要密码，请重新开始。"; }
-                finally { view.Starting = false; SetGoogleLoginControls(view, view.Active); }
-            }); AutomationProperties.SetName(next, "继续 Google 登录流程"); next.Visibility = Visibility.Collapsed; next.Margin = new Thickness(0, 8, 6, 0);
+            var verify = Button("检测 Dola 登录", async () => await VerifyGoogleLogin(id, view!)); AutomationProperties.SetName(verify, "已手动完成，验证 Dola 登录"); verify.Margin = new Thickness(6, 8, 0, 0); verify.Visibility = Visibility.Collapsed;
+            var next = Button("继续登录流程", async () => await ContinueGoogleLogin(id, view!)); AutomationProperties.SetName(next, "继续 Google 登录流程"); next.Visibility = Visibility.Collapsed; next.Margin = new Thickness(0, 8, 6, 0);
             var followup = new Grid(); followup.ColumnDefinitions.Add(new ColumnDefinition()); followup.ColumnDefinitions.Add(new ColumnDefinition());
             followup.Children.Add(next); Grid.SetColumn(verify, 1); followup.Children.Add(verify); footer.Children.Add(followup);
-            var cancel = Button("停止自动填写", async () => {
-                view!.Cancel.IsEnabled = false;
-                try { await Api($"profiles/{id}/google-login/cancel", new { }); await PollGoogleLogin(); }
-                catch { view.Status.Text = "停止请求未完成，请稍后重试。"; view.Cancel.IsEnabled = true; }
-            }); cancel.Visibility = Visibility.Collapsed; cancel.Margin = new Thickness(0, 8, 0, 0); footer.Children.Add(cancel);
+            var cancel = Button("停止自动填写", async () => await CancelGoogleLogin(id, view!)); cancel.Visibility = Visibility.Collapsed; cancel.Margin = new Thickness(0, 8, 0, 0); footer.Children.Add(cancel);
             var forget = Button("清除已保存的 Google 密码", async () => {
                 try { await Api($"profiles/{id}/google-credentials/forget", new { }); view!.Password.Clear(); await ReloadGoogleCredentials(id, view); view.Status.Text = "已清除本机保存的密码，浏览器登录会话仍保留。"; }
                 catch { view!.Status.Text = "密码清除失败，请先停止登录再重试。"; }
             }); forget.Margin = new Thickness(0, 12, 0, 0); forget.Foreground = Hex("#ED9D9D"); forget.Visibility = Visibility.Collapsed; panel.Children.Add(forget);
             view = new GoogleLoginView { Panel = panel, Footer = footer, Email = email, Password = password, Remember = remember, UseSaved = saved, Onboarding = onboarding, AgeConfirmed = ageConfirmed, Continue = next, Status = statusText, SavedHint = hint, Start = start, Cancel = cancel, Verify = verify, Forget = forget, Progress = progress };
             AttachGoogleLoginFooter(container, footer);
+            ((ScrollViewer)container.Parent).SizeChanged += (_, _) => RevealGoogleAge(view);
             googleLoginViews[id] = view;
             panel.SizeChanged += (_, _) => RevealGoogleAge(view);
             void SavedChoice() { password.IsEnabled = !view.Active && !view.Starting && saved.IsChecked != true; if (saved.IsChecked == true) password.Clear(); }
@@ -151,13 +141,14 @@ public sealed partial class MainWindow
         // Capture only for this request. Clear the visible PasswordBox after the
         // worker accepts it; never print an HTTP body or exception payload.
         string? secret = view.Password.Password;
-        view.Starting = true; SetGoogleLoginControls(view, true); view.Status.Text = "正在准备独立浏览器…";
+        view.Starting = true; view.Dismissed = false; SetGoogleLoginControls(view, true); view.Status.Text = "正在准备独立浏览器…"; RenderBrowserLoginActivity();
         try {
             await LaunchQueued(id, selectBrowser: false);
             var job = await Api($"profiles/{id}/google-login", new { email, password = saved ? "" : secret, useSaved = saved, remember = view.Remember.IsChecked == true, allowOnboarding = view.Onboarding.IsChecked == true, ageConfirmed = view.AgeConfirmed.IsChecked == true });
             view.Password.Clear(); view.AgeConfirmed.IsChecked = false; UpdateGoogleLoginView(view, job); await ReloadGoogleCredentials(id, view);
+            Select(id);
         } catch { view.Status.Text = "未能启动登录。请检查浏览器、邮箱与密码；若使用已存密码，请确认邮箱与原保存账号一致。"; }
-        finally { secret = null; view.Starting = false; SetGoogleLoginControls(view, view.Active); }
+        finally { secret = null; view.Starting = false; SetGoogleLoginControls(view, view.Active); RenderBrowserLoginActivity(); }
     }
 
     void SetGoogleLoginControls(GoogleLoginView view, bool busy)
@@ -171,8 +162,11 @@ public sealed partial class MainWindow
     }
 
     static string GoogleLoginStage(string stage) => stage switch {
-        "opening_dola" => "正在寻找 Dola 的 Google 登录入口…", "submitting_email" => "正在填写 Google 邮箱…", "submitting_password" => "正在填写 Google 密码…",
+        "opening_dola" => "正在打开 Dola 登录入口…", "loading_dola" => "等待 Dola 登录入口加载，首次打开可能需要几十秒…", "submitting_email" => "正在填写 Google 邮箱…", "submitting_password" => "正在填写 Google 密码…",
         "waiting_google" => "等待 Google 页面加载与跳转…", "waiting_dola" => "等待返回 Dola 并确认登录…",
+        "locating_google" => "Dola 登录框已打开，正在识别 Google 登录按钮…",
+        "google_entry_waiting_manual" => "Google 登录入口暂未响应，已停止重复点击；可手动点击 Google 登录，本次任务仍会接着填写。",
+        "google_entry_unresponsive" => "等待 Google 登录入口超时，请检查网络后点击重新登录。",
         "resuming" => "正在继续当前登录页面…",
         "confirming_workspace" => "正在确认 Google Workspace 新账号欢迎页…",
         "authorizing_dola" => "正在确认 Dola 的姓名、头像与邮箱基础登录授权…",
@@ -182,7 +176,7 @@ public sealed partial class MainWindow
         "credentials_required" => "当前页面仍需填写 Google 邮箱或密码，请重新输入后开始登录。",
         "logged_in" => "已确认 Dola 登录，会话已保存。", "already_logged_in" => "当前环境已登录 Dola，无需重复登录。",
         "existing_session_unverified" => "浏览器已有登录会话，尚未核对是否为绑定账号。请在网页确认；更换账号建议使用新环境。绑定不会自动退出网站账号。",
-        "verification_required" => "需要你完成验证码、两步验证或手机确认。请打开浏览器接管，完成后验证 Dola 登录。",
+        "verification_required" => "请在网页中完成验证码、两步验证或手机确认，然后点击“已完成，继续”或“检测登录”。",
         "consent_required" => "Google 需要确认授权。基础 Dola 授权可勾选自动处理后继续；额外权限或无法识别的页面请手动确认。",
         "choose_account" => "请在 Google 页面选择要登录的账号，再点击继续登录流程。",
         "account_mismatch" => "Google 页面显示的账号与填写邮箱不同，未提交密码。请手动选择正确账号。",
@@ -200,20 +194,22 @@ public sealed partial class MainWindow
 
     void UpdateGoogleLoginView(GoogleLoginView view, JsonElement job)
     {
-        string state = Str(job, "state"); view.Active = state is "running" or "cancelling";
+        string state = Str(job, "state"); view.State = state; view.Active = state is "running" or "cancelling";
         view.Stage = Str(job, "stage");
         string version = Str(job, "id") + ":" + Str(job, "updatedAt");
         bool changed = state != "idle" && version != view.LastJobVersion;
-        if (changed) view.Status.Text = GoogleLoginStage(Str(job, "stage"));
+        if (changed) { view.Status.Text = GoogleLoginStage(Str(job, "stage")); view.Dismissed = false; }
         view.LastJobVersion = version;
         view.Verify.Visibility = state is "needs_attention" or "failed" or "cancelled" or "completed" ? Visibility.Visible : Visibility.Collapsed;
-        view.Continue.Visibility = state == "needs_attention" ? Visibility.Visible : Visibility.Collapsed;
-        Grid.SetColumn(view.Verify, state == "needs_attention" ? 1 : 0);
-        Grid.SetColumnSpan(view.Verify, state == "needs_attention" ? 1 : 2);
-        view.Verify.Margin = new Thickness(state == "needs_attention" ? 6 : 0, 8, 0, 0);
+        bool canContinue = state == "needs_attention" && view.Stage != "credentials_required";
+        view.Continue.Visibility = canContinue ? Visibility.Visible : Visibility.Collapsed;
+        Grid.SetColumn(view.Verify, canContinue ? 1 : 0);
+        Grid.SetColumnSpan(view.Verify, canContinue ? 1 : 2);
+        view.Verify.Margin = new Thickness(canContinue ? 6 : 0, 8, 0, 0);
         view.Status.Foreground = state == "completed" ? WorkbenchTheme.Green : state is "needs_attention" or "failed" ? Hex("#E8B578") : Text;
         SetGoogleLoginControls(view, view.Active || view.Starting);
         if (changed) RevealGoogleAge(view);
+        RenderBrowserLoginActivity(); UpdateGlobalActivity();
     }
 
     static void RevealGoogleAge(GoogleLoginView view)
@@ -233,10 +229,10 @@ public sealed partial class MainWindow
         if (googleLoginPolling || closing) return; googleLoginPolling = true;
         try {
             foreach (var (id, view) in googleLoginViews.ToArray()) {
-                if (view.Starting || !view.Active && !view.Panel.IsVisible) continue;
+                if (view.Starting || !view.Active && !view.Panel.IsVisible && id != selected && view.State != "needs_attention") continue;
                 try { var job = await Api($"profiles/{id}/google-login"); UpdateGoogleLoginView(view, job); }
                 catch { if (view.Active) view.Status.Text = "登录进度暂时无法读取；可打开浏览器查看，软件不会自动重复提交。"; }
             }
-        } finally { googleLoginPolling = false; }
+        } finally { googleLoginPolling = false; RenderBrowserLoginActivity(); }
     }
 }

@@ -24,6 +24,8 @@ partial class Program
             row.GetType().GetProperty("Chosen")!.SetValue(row, chosen);
         }
         await Post("profiles", new { id = "center-second", name = "批量账号二", accountEmail = "two@example.invalid", accountGroup = "项目乙", startUrl = new Uri(client.BaseAddress!, "probe").ToString() });
+        var account = await Post("login-accounts", new { email = "bound-account@example.invalid", password = "isolated-binding-secret" });
+        await Post("profiles/center-second/login-account", new { accountId = account.GetProperty("id").GetString() });
         await (Task)Method("LoadProxyCatalog").Invoke(main, null)!;
         await (Task)Method("Launch").Invoke(main, new object[] { "ui-browser" })!;
         var before = await BrowserState(client); var port = before.GetProperty("cdpPort").GetInt32();
@@ -34,6 +36,12 @@ partial class Program
         Method("ShowAccountCenter").Invoke(main, null); await Task.Delay(150);
         var table = Named<DataGrid>(main, "环境管理列表");
         Check("Account center is in main window and hides native browser", !IsWindowVisible(native) && main.OwnedWindows.Count == 0 && table.Items.Count == 2);
+        Check("Environment list has a dedicated frozen bound-account column", table.Columns.Any(c => Equals(c.Header, "关联 Google 账号")) && table.FrozenColumnCount == 3);
+        var accountRow = table.Items.Cast<object>().Single(r => (string)r.GetType().GetProperty("Id")!.GetValue(r)! == "center-second");
+        Check("Environment shows actual binding instead of metadata email or website identity", (string)accountRow.GetType().GetProperty("Email")!.GetValue(accountRow)! == "bound-account@example.invalid");
+        Named<TextBox>(main, "环境管理搜索").Text = "bound-account@";
+        Check("Environment search finds associated Google account", table.Items.Count == 1);
+        Named<TextBox>(main, "环境管理搜索").Clear();
         Choose(table, "ui-browser", true); Choose(table, "center-second", true);
         Check("Account center selection has real count", Named<TextBlock>(main, "环境选择统计").Text.Contains("已选 2"));
         Named<TextBox>(main, "环境管理搜索").Text = "two@example";

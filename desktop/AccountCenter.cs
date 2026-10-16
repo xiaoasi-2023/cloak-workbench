@@ -25,7 +25,8 @@ public sealed partial class MainWindow
     readonly List<AccountCenterRow> centerRows = new();
     DataGrid? centerTable;
     CheckBox? centerSelectAll;
-    Button? centerCancel;
+    Button? centerCancel, centerDismiss;
+    bool centerResultWarning = true;
     string? centerJobId, centerDetailId, centerSignature;
     bool centerBusy, centerJobPolling, centerSelecting, centerCancelRequested;
     int centerDetailVersion;
@@ -133,7 +134,7 @@ public sealed partial class MainWindow
                 var proxyId = Str(p, "proxyId"); var proxy = proxyCatalog.FirstOrDefault(entry => Str(entry, "id") == proxyId);
                 var job = accountJobStates.GetValueOrDefault(id, "");
                 var row = existing.GetValueOrDefault(id) ?? new AccountCenterRow { Id = id };
-                row.Update(Str(p, "name"), BoundAccountEmail(p).Length > 0 ? BoundAccountEmail(p) : "手动登录环境", Str(p, "accountGroup").Length == 0 ? "未分组" : Str(p, "accountGroup"), Str(p, "state") is "running" or "starting" ? "运行中" : "已关闭", job == "running" ? "正在检测…" : job is "queued" or "pending" ? "等待检测" : AccountHealthLabel(p), network.ValueKind == JsonValueKind.Object ? NetworkCountryName(network) : "未检测", AccountObservationTime(p), proxyId.Length == 0 ? Str(p, "proxy").Length > 0 ? "手动代理" : "本机直连" : proxy.ValueKind == JsonValueKind.Object ? Str(proxy, "name") : "代理已移除", network.ValueKind == JsonValueKind.Object ? AccountTime(Str(network, "checkedAt", Str(network, "testedAt"))) : "未检测"); row.Chosen = selectedAccounts.Contains(id);
+                row.Update(Str(p, "name"), BoundAccountEmail(p).Length > 0 ? BoundAccountEmail(p) : "未绑定账号", Str(p, "accountGroup").Length == 0 ? "未分组" : Str(p, "accountGroup"), Str(p, "state") is "running" or "starting" ? "运行中" : "已关闭", job == "running" ? "正在检测…" : job is "queued" or "pending" ? "等待检测" : AccountHealthLabel(p), network.ValueKind == JsonValueKind.Object ? NetworkCountryName(network) : "未检测", AccountObservationTime(p), proxyId.Length == 0 ? Str(p, "proxy").Length > 0 ? "手动代理" : "本机直连" : proxy.ValueKind == JsonValueKind.Object ? Str(proxy, "name") : "代理已移除", network.ValueKind == JsonValueKind.Object ? AccountTime(Str(network, "checkedAt", Str(network, "testedAt"))) : "未检测"); row.Chosen = selectedAccounts.Contains(id);
                 row.Changed = chosen => { if (chosen) selectedAccounts.Add(id); else selectedAccounts.Remove(id); UpdateCenterSelection(); }; centerRows.Add(row);
             }
             if (!previousIds.SequenceEqual(centerRows.Select(r => r.Id))) { centerTable.ItemsSource = centerRows.ToArray(); centerTable.SelectedItem = centerRows.FirstOrDefault(r => r.Id == activeId); }
@@ -153,21 +154,29 @@ public sealed partial class MainWindow
     }
     async Task CenterSafe(Func<Task> action)
     {
-        try { await action(); } catch (Exception ex) { centerFeedback.Text = ex.Message; centerFeedback.Foreground = Hex("#ED9D9D"); centerActivity.Visibility = Visibility.Visible; centerJobText.Text = "操作未完成"; CenterResultPresentation(); centerResults.Visibility = Visibility.Visible; centerResultToggle!.Content = "收起明细"; Log("账号中心：" + ex.Message); }
+        try { await action(); } catch (Exception ex) { CancelFeedbackDismissal(centerActivity); centerResultWarning = true; centerFeedback.Text = ex.Message; centerFeedback.Foreground = Hex("#ED9D9D"); centerActivity.Visibility = Visibility.Visible; centerJobText.Text = "操作未完成"; CenterResultPresentation(); centerResults.Visibility = Visibility.Visible; centerResultToggle!.Content = "收起明细"; Log("账号中心：" + ex.Message); }
     }
     void CenterSetBusy(bool busy)
     {
+        bool finished = centerBusy && !busy;
+        if (busy) { CancelFeedbackDismissal(centerActivity); centerResultWarning = true; }
         centerBusy = busy; foreach (var b in centerOperations) b.IsEnabled = !busy; centerAction.IsEnabled = !busy; if (centerSelectAll != null) centerSelectAll.IsEnabled = !busy;
         centerCancel!.IsEnabled = busy && !centerCancelRequested;
         CenterResultPresentation();
+        if (finished) ScheduleCenterFeedbackDismissal();
+    }
+    void ScheduleCenterFeedbackDismissal()
+    {
+        if (!centerBusy && !centerResultWarning && centerFeedback.Text.Length > 0 && centerResults.Visibility != Visibility.Visible)
+            DismissFeedbackLater(centerActivity, () => centerActivity.Visibility = Visibility.Collapsed);
     }
     void CenterProgress(string text, int completed, int total)
     {
-        centerActivity.Visibility = Visibility.Visible; centerJobText.Text = text; centerProgress.Maximum = Math.Max(1, total); centerProgress.Value = completed;
+        CancelFeedbackDismissal(centerActivity); centerActivity.Visibility = Visibility.Visible; centerJobText.Text = text; centerProgress.Maximum = Math.Max(1, total); centerProgress.Value = completed;
     }
     async Task ExecuteAccountAction()
     {
-        if (centerBusy) return; var ids = selectedAccounts.Where(profiles.ContainsKey).ToArray(); if (ids.Length == 0) { centerActivity.Visibility = Visibility.Visible; centerJobText.Text = "请先勾选需要操作的环境"; centerFeedback.Text = "全选仅作用于当前筛选结果。跨筛选保留已选环境。"; CenterResultPresentation(); return; }
+        if (centerBusy) return; var ids = selectedAccounts.Where(profiles.ContainsKey).ToArray(); if (ids.Length == 0) { CancelFeedbackDismissal(centerActivity); centerResultWarning = true; centerActivity.Visibility = Visibility.Visible; centerJobText.Text = "请先勾选需要操作的环境"; centerFeedback.Text = "全选仅作用于当前筛选结果。跨筛选保留已选环境。"; CenterResultPresentation(); return; }
         var action = centerAction.SelectedIndex;
         if (action >= 4) { ShowAccountBinding(action == 4); return; }
         centerCancelRequested = false; CenterSetBusy(true); centerFeedback.Text = ""; centerFeedback.Foreground = Muted;
@@ -187,6 +196,7 @@ public sealed partial class MainWindow
                 completed++; CenterProgress($"已处理 {completed} / {ids.Length}  ·  成功 {succeeded}", completed, ids.Length);
             }
             centerFeedback.Text = $"成功 {succeeded}，失败 {completed - succeeded}，未执行 {ids.Length - completed}。" + Environment.NewLine + string.Join(Environment.NewLine, results);
+            centerResultWarning = succeeded != ids.Length || centerCancelRequested;
         } finally { try { await Refresh(); } finally { CenterSetBusy(false); } }
     }
     async Task PollAccountJob()
@@ -204,6 +214,11 @@ public sealed partial class MainWindow
                     if (Str(result, "applied").Equals("false", StringComparison.OrdinalIgnoreCase)) description += " · 未保存（配置可能已变化）";
                     lines.Add(name + "：" + description); }
                 centerJobText.Text = state == "cancelled" ? $"检测已取消  ·  已处理 {completed} / {total}" : $"检测结束  ·  已处理 {completed} / {total}"; centerFeedback.Text = string.Join(Environment.NewLine, lines);
+                centerResultWarning = state != "completed" || completed != total || !job.TryGetProperty("results", out var finalResults) || finalResults.GetArrayLength() != total || finalResults.EnumerateArray().Any(result => {
+                    var check = AccountObject(result, "check");
+                    return !Str(result, "applied").Equals("true", StringComparison.OrdinalIgnoreCase) || check.ValueKind != JsonValueKind.Object ||
+                        !(check.TryGetProperty("reachable", out _) ? Str(check, "reachable").Equals("true", StringComparison.OrdinalIgnoreCase) : Str(check, "status") == "logged_in");
+                });
                 if (centerDetailId != null && centerSide.Visibility == Visibility.Visible) await LoadAccountDetails(centerDetailId);
             }
         } finally { centerJobPolling = false; if (centerJobId == null) CenterSetBusy(false); }
@@ -238,7 +253,7 @@ public sealed partial class MainWindow
         var ids = selectedAccounts.ToArray(); var panel = CenterPanel(group ? "更改分组" : "绑定代理", $"将应用到 {ids.Length} 个已选环境。" + (group ? "留空表示移出分组。" : "正在运行的环境不会更改代理，请先关闭会话。住宅会话按环境独立保存。"));
         TextBox? input = group ? CenterField(panel, "目标分组") : null; ComboBox? picker = group ? null : CenterProxyPicker(panel, "目标代理");
         var result = new TextBlock { Foreground = Muted, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 14, 0, 0) }; Button? apply = null;
-        apply = Button("应用到所选环境", async () => { if (centerBusy) return; apply!.IsEnabled = false; CenterSetBusy(true); try { var body = new Dictionary<string, object?> { ["ids"] = ids, ["action"] = group ? "group" : "proxy" }; body[group ? "accountGroup" : "proxyId"] = group ? input!.Text.Trim() : picker!.SelectedValue as string ?? ""; var response = await Api("accounts/batch", body); result.Text = $"成功 {Num(response, "succeeded")}，失败 {Num(response, "failed")}。" + Environment.NewLine + CenterResultLines(response); await Refresh(); } catch (Exception ex) { result.Text = ex.Message; } finally { apply.IsEnabled = true; CenterSetBusy(false); } }, true); panel.Children.Add(apply); panel.Children.Add(result);
+        apply = Button("应用到所选环境", async () => { if (centerBusy) return; apply!.IsEnabled = false; CancelFeedbackDismissal(result); CenterSetBusy(true); try { var body = new Dictionary<string, object?> { ["ids"] = ids, ["action"] = group ? "group" : "proxy" }; body[group ? "accountGroup" : "proxyId"] = group ? input!.Text.Trim() : picker!.SelectedValue as string ?? ""; var response = await Api("accounts/batch", body); result.Text = $"成功 {Num(response, "succeeded")}，失败 {Num(response, "failed")}。" + Environment.NewLine + CenterResultLines(response); await Refresh(); if (Num(response, "failed") == 0) ShowTemporaryFeedback(result, result.Text); } catch (Exception ex) { result.Text = ex.Message; } finally { apply.IsEnabled = true; CenterSetBusy(false); } }, true); panel.Children.Add(apply); panel.Children.Add(result);
     }
     string CenterResultLines(JsonElement response)
     {

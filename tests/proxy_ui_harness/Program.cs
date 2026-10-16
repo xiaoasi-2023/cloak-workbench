@@ -53,6 +53,9 @@ internal static partial class Program
         client.BaseAddress=new Uri(args[0]);
         main.Loaded += async (_,_) => {
             try {
+                if (args.Contains("--videos")) { await Videos(main,client,output); exit=0; return; }
+                if (args.Contains("--feedback")) { await Feedback(main,output); exit=0; return; }
+                if (args.Contains("--workspaces")) { await Workspaces(main,client,output); exit=0; return; }
                 if (args.Contains("--lifecycle")) { await BrowserLifecycle(main,client); exit=0; return; }
                 if (args.Contains("--browser-workspace")) { await BrowserWorkspace(main,client,output); exit=0; return; }
                 if (args.Contains("--product-flow")) { await ProductFlow(main,client,output); exit=0; return; }

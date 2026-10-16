@@ -119,6 +119,11 @@ public sealed partial class MainWindow
         var activity = new Border { Background = Hex("#203B33"), BorderBrush = Hex("#345D4F"), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(10), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(0, 0, 0, 14), Visibility = Visibility.Collapsed };
         System.Windows.Automation.AutomationProperties.SetName(activity, "代理检测状态");
         var activityPanel = new StackPanel(); var activityHeading = new DockPanel();
+        void DismissActivity() { CancelFeedbackDismissal(activity); activity.Visibility = Visibility.Collapsed; feedback.Text = ""; }
+        var dismissActivity = IconButton("close", "", DismissActivity);
+        dismissActivity.ToolTip = "关闭检测结果提示"; dismissActivity.Padding = new Thickness(6); dismissActivity.Background = Brushes.Transparent; dismissActivity.BorderThickness = new Thickness(0);
+        System.Windows.Automation.AutomationProperties.SetName(dismissActivity, "关闭代理检测提示");
+        DockPanel.SetDock(dismissActivity, Dock.Right); activityHeading.Children.Add(dismissActivity);
         var spinner = ProxySpinner(); spinner.Margin = new Thickness(0, 0, 12, 0); DockPanel.SetDock(spinner, Dock.Left); activityHeading.Children.Add(spinner);
         var activityMark = new TextBlock { FontSize = 21, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 12, 0), Visibility = Visibility.Collapsed }; DockPanel.SetDock(activityMark, Dock.Left); activityHeading.Children.Add(activityMark);
         var counter = new TextBlock { Foreground = Accent, FontSize = 12, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) }; DockPanel.SetDock(counter, Dock.Right); activityHeading.Children.Add(counter);
@@ -153,6 +158,7 @@ public sealed partial class MainWindow
         var operations = new List<Button>(); Button? cancelCheck = null;
         void SetBusy(bool value) { busy = value; foreach (var operation in operations) operation.IsEnabled = !value; cancelCheck!.IsEnabled = value && jobId != null && jobState != "cancelling"; }
         void ShowActivity(string titleText, string hint, bool active, bool warning = false) {
+            CancelFeedbackDismissal(activity);
             proxyActivitySummary = active ? "代理检测 · " + titleText : null; UpdateGlobalActivity();
             bool opening = activity.Visibility != Visibility.Visible; activity.Visibility = Visibility.Visible;
             activityTitle.Text = titleText; activityHint.Text = hint; spinner.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
@@ -161,6 +167,8 @@ public sealed partial class MainWindow
             activity.Background = active ? Hex("#203B33") : warning ? Hex("#392E20") : Hex("#203B30");
             activity.BorderBrush = active ? Hex("#345D4F") : warning ? Hex("#675236") : Hex("#345D4F");
             progress.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+            dismissActivity.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
+            if (!active && !warning) DismissFeedbackLater(activity, DismissActivity);
             if (opening && SystemParameters.ClientAreaAnimation) activity.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180)));
         }
         void UpdateRows() { foreach (var row in rows) row.Update(row.Data, rowStates.GetValueOrDefault(row.Id, "")); }
@@ -235,7 +243,7 @@ public sealed partial class MainWindow
         selectAll.Checked += (_, _) => SelectAll(true); selectAll.Unchecked += (_, _) => SelectAll(false);
         table.MouseDoubleClick += (_, _) => { if (!busy && table.SelectedItem is ProxyRow row) page.Content = BuildProxyDetails(row, BackToList); };
         jobTimer.Tick += async (_, _) => await PollJob(); layout.Loaded += async (_, _) => await Safe(() => Reload());
-        async void Cleanup(object? sender, EventArgs args) { if (ended) return; ended = true; jobTimer.Stop(); elapsed.Stop(); proxyActivitySummary = null; UpdateGlobalActivity(); progress.IsIndeterminate = false; progress.BeginAnimation(System.Windows.Controls.Primitives.RangeBase.ValueProperty, null); activity.BeginAnimation(UIElement.OpacityProperty, null); window.Closed -= Cleanup; if (jobId != null) try { await Api("proxy-checks/" + jobId + "/cancel", new { }); } catch { } }
+        async void Cleanup(object? sender, EventArgs args) { if (ended) return; ended = true; CancelFeedbackDismissal(activity); jobTimer.Stop(); elapsed.Stop(); proxyActivitySummary = null; UpdateGlobalActivity(); progress.IsIndeterminate = false; progress.BeginAnimation(System.Windows.Controls.Primitives.RangeBase.ValueProperty, null); activity.BeginAnimation(UIElement.OpacityProperty, null); window.Closed -= Cleanup; if (jobId != null) try { await Api("proxy-checks/" + jobId + "/cancel", new { }); } catch { } }
         window.Closed += Cleanup;
         page.Unloaded += Cleanup;
         return page;

@@ -63,7 +63,7 @@ public sealed partial class MainWindow : Window
         Loaded += async (_, _) => { await Refresh(); try { await LoadProxyCatalog(); RenderAccounts(); } catch (Exception ex) { Log("代理列表读取失败：" + ex.Message); } timer.Start(); if (smoke) await Smoke(); else if (resume) await RestoreSession(); };
         Closing += async (_, e) => {
             if (closing) return;
-            e.Cancel = true; closing = true; timer.Stop();
+            e.Cancel = true; closing = true; timer.Stop(); StopFeedbackTimers();
             // Keep native parents alive until Chromium closes. Detaching first
             // restores the standalone window and causes a desktop flash.
             foreach (var host in hosts.Values) { try { host.ShowBrowser(false); } catch (Exception ex) { Log(ex.Message); } }
@@ -116,12 +116,16 @@ public sealed partial class MainWindow : Window
         diagnosticsWorkspace.Visibility = page == diagnosticsWorkspace ? Visibility.Visible : Visibility.Collapsed;
         accountWorkspace.Visibility = page == accountWorkspace ? Visibility.Visible : Visibility.Collapsed;
         loginAccountsWorkspace.Visibility = page == loginAccountsWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        enterpriseWorkspace.Visibility = page == enterpriseWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        videoWorkspace.Visibility = page == videoWorkspace ? Visibility.Visible : Visibility.Collapsed;
         profileSettingsWorkspace.Visibility = page == profileSettingsWorkspace ? Visibility.Visible : Visibility.Collapsed;
         UpdateNavigation();
         page.Focus();
     }
     void ShowBrowserPage()
     {
+        videoWorkspace.Visibility = Visibility.Collapsed;
+        enterpriseWorkspace.Visibility = Visibility.Collapsed;
         currentPage = "环境工作台";
         proxyWorkspace.Visibility = Visibility.Collapsed;
         diagnosticsWorkspace.Visibility = Visibility.Collapsed;
@@ -184,6 +188,7 @@ public sealed partial class MainWindow : Window
             if (currentPage == "环境工作台" && selected != null && hosts.TryGetValue(selected, out var visibleHost)) visibleHost.RefreshBounds();
             RenderAccounts(); RenderTabs(); RenderAccountCenter();
             UpdateBrowserPresentation();
+            if (!videoLoaded || activeVideoCount > 0 || currentPage == "视频生成") await LoadVideos();
             UpdateGlobalActivity();
             if (currentPage == "账号列表") await LoadLoginAccounts();
             if (selected != null && profiles.TryGetValue(selected, out var current) && !address.IsKeyboardFocusWithin) address.Text = Str(current, "url", Str(current, "startUrl"));
@@ -220,6 +225,7 @@ public sealed partial class MainWindow : Window
     }
     void UpdateBrowserPresentation()
     {
+        RenderBrowserLoginActivity();
         bool active = selected != null && profiles.TryGetValue(selected, out var p) && Str(p, "state") == "running" && !launching.Contains(selected) && !closingProfiles.Contains(selected);
         foreach (var command in browserCommands) command.IsEnabled = active;
         if (presentationButton != null) presentationButton.ToolTip = selected != null && hosts.ContainsKey(selected) ? "切换为独立窗口" : "嵌回工作台";
@@ -282,6 +288,8 @@ public sealed partial class MainWindow : Window
     }
     void Select(string id)
     {
+        videoWorkspace.Visibility = Visibility.Collapsed;
+        enterpriseWorkspace.Visibility = Visibility.Collapsed;
         currentPage = "环境工作台";
         proxyWorkspace.Visibility = Visibility.Collapsed;
         diagnosticsWorkspace.Visibility = Visibility.Collapsed;

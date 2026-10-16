@@ -132,6 +132,9 @@ class ProxyCatalog:
         with self.worker.lock:
             entry = self.merge(payload)
             old = self.entries.get(entry["id"])
+            tenants = getattr(self.worker, 'workspaces', None)
+            if old and tenants and any(r.get('proxyId') == entry['id'] and tenants._busy(r['id']) for r in tenants.records.values()):
+                raise self.error(409, '企业管理正在使用此线路，请等待任务结束再编辑。')
             if old and any(p.get("proxyId") == entry["id"] and self.worker.is_running(pid) for pid, p in self.worker.profiles.items()):
                 raise self.error(409, "Close bound environments before editing this proxy")
             same_route = bool(old and policy_key(old) == policy_key(entry))
@@ -155,6 +158,9 @@ class ProxyCatalog:
     def delete(self, pid):
         with self.worker.lock:
             entry = self.entry(pid)
+            tenants = getattr(self.worker, 'workspaces', None)
+            if tenants and any(r.get('proxyId') == pid for r in tenants.records.values()):
+                raise self.error(409, '此代理仍被企业连接引用，请先修改企业连接的网络线路。')
             if any(p.get("proxyId") == pid for p in self.worker.profiles.values()):
                 raise self.error(409, "This proxy is still bound to an environment")
             if pid in self.inflight:

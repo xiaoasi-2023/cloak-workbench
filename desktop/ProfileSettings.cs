@@ -12,6 +12,22 @@ public sealed partial class MainWindow
     int profileSettingsOpenVersion;
     readonly Dictionary<string, FrameworkElement> profileSettingsDrafts = new();
 
+    string SuggestEnvironmentName(string? accountId = null)
+    {
+        string prefix = "环境";
+        if (accountId != null && loginAccounts.TryGetValue(accountId, out var account)) {
+            var email = Str(account, "email");
+            if (email.Contains('@')) prefix = email.Split('@')[0];
+        }
+        if (prefix.Length > 100) prefix = prefix[..100];
+        var used = profiles.Values.Select(profile => Str(profile, "name")).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        string separator = prefix == "环境" ? " " : " · ";
+        for (int number = 1; ; number++) {
+            string candidate = prefix + separator + number.ToString("D3");
+            if (!used.Contains(candidate)) return candidate;
+        }
+    }
+
     async void EditProfile(string? id)
     {
         int opening = ++profileSettingsOpenVersion;
@@ -80,7 +96,8 @@ public sealed partial class MainWindow
             var grid = Pair(parent); var a = new StackPanel(); var b = new StackPanel(); Grid.SetColumn(b, 2); grid.Children.Add(a); grid.Children.Add(b); Field(a, left.key, left.title, left.value); Field(b, right.key, right.title, right.value);
         }
         var basic = Section("基本信息", "为每个账号保留独立的浏览器数据与登录状态。");
-        Field(basic, "name", "环境名称", "新环境");
+        var name = Field(basic, "name", "环境名称", id == null ? SuggestEnvironmentName(initialAccountId) : "", id == null ? "已自动命名，可直接保存，也可以自行修改。" : null);
+        name.MaxLength = 120;
         Field(basic, "accountGroup", "环境分组（可选）");
         var notes = Field(basic, "accountNotes", "环境备注（可选）"); notes.AcceptsReturn = true; notes.TextWrapping = TextWrapping.Wrap; notes.MinHeight = 66; notes.MaxLength = 1000;
         var identity = Section("Google 账号", "账号是邮箱和密码；绑定后用于自动登录，不代表当前网页已经登录该账号。未绑定也可以手动登录。");
@@ -88,6 +105,22 @@ public sealed partial class MainWindow
         if (id == null && initialAccountId != null) {
             loginAccountPicker.SelectedValue = initialAccountId;
             if (loginAccountPicker.SelectedValue as string != initialAccountId) throw new InvalidOperationException("此账号已绑定其他环境或已删除，请返回账号列表刷新后重试。");
+        }
+        if (id == null) {
+            string automaticName = name.Text;
+            void AssignName() { automaticName = SuggestEnvironmentName(loginAccountPicker.SelectedValue as string); name.Text = automaticName; }
+            loginAccountPicker.SelectionChanged += (_, _) => {
+                if (string.IsNullOrWhiteSpace(name.Text) || name.Text == automaticName) AssignName();
+            };
+            var wrapper = (StackPanel)name.Parent;
+            wrapper.Children.Remove(name);
+            var nameRow = new DockPanel { LastChildFill = true };
+            var generateName = Button("自动命名", AssignName);
+            generateName.Margin = new Thickness(10, 5, 0, 0);
+            generateName.ToolTip = "按当前绑定账号生成未使用的环境名称";
+            System.Windows.Automation.AutomationProperties.SetName(generateName, "自动命名环境");
+            DockPanel.SetDock(generateName, Dock.Right); nameRow.Children.Add(generateName); nameRow.Children.Add(name);
+            wrapper.Children.Insert(1, nameRow);
         }
         var startup = new StackPanel(); Field(startup, "startUrl", "启动网址", "https://www.dola.com/");
         PairFields(startup, ("screenWidth", "初始窗口宽度", "1280"), ("screenHeight", "初始窗口高度", "800"));
@@ -198,7 +231,10 @@ public sealed partial class MainWindow
             if (saving || dialogClosed) return;
             saving = true; save!.IsEnabled = false; if (cancel != null) cancel.IsEnabled = false; error.Text = "";
             try {
-                if (inputs["name"].Text.Trim().Length == 0) throw new InvalidOperationException("请填写环境名称。");
+                if (inputs["name"].Text.Trim().Length == 0) {
+                    if (id == null) inputs["name"].Text = SuggestEnvironmentName(loginAccountPicker.SelectedValue as string);
+                    else throw new InvalidOperationException("请填写环境名称。");
+                }
                 running = id != null && profiles.TryGetValue(id, out var latest) && Str(latest, "state") is "running" or "starting";
                 if (running && id != null) {
                     await Api($"profiles/{id}/account", new { name = inputs["name"].Text.Trim(), accountGroup = inputs["accountGroup"].Text.Trim(), accountNotes = inputs["accountNotes"].Text.Trim() });

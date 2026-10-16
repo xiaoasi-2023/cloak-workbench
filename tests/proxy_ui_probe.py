@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--browser-workspace", action="store_true")
     parser.add_argument("--product-flow", action="store_true")
     parser.add_argument("--environment-semantics", action="store_true")
+    parser.add_argument("--feedback", action="store_true")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="cloak-proxy-ui-") as directory:
         temp = Path(directory)
@@ -85,7 +86,7 @@ def main():
             with patch("proxy_catalog.diagnose_proxy", side_effect=slow_diagnostic), patch("account_management.diagnose_proxy", side_effect=slow_diagnostic), patch("server.diagnose_proxy", side_effect=slow_diagnostic), patch.object(worker.google_login, '_run', side_effect=login_fixture) if args.google_login or args.login_accounts else nullcontext():
                 result = subprocess.run([str(ROOT / ".tools/dotnet/dotnet.exe"),
                     str(ROOT / ".local/proxy-ui-build/ProxyUiHarness.dll"),
-                    f"http://127.0.0.1:{server.server_port}/", str(args.out), *(['--environment-semantics'] if args.environment_semantics else []), *(['--browser-workspace'] if args.browser_workspace else []), *(['--product-flow'] if args.product_flow else []), *(['--login-accounts'] if args.login_accounts else []), *(['--accounts'] if args.accounts else []), *(['--account-center'] if args.account_center else []), *(['--google-login'] if args.google_login else []), *(['--session-backup'] if args.session_backup else []), *(['--proxy-sessions'] if args.proxy_sessions else []), *(['--diagnostics'] if args.diagnostics else [])], cwd=ROOT, env=env, timeout=180)
+                    f"http://127.0.0.1:{server.server_port}/", str(args.out), *(['--feedback'] if args.feedback else []), *(['--environment-semantics'] if args.environment_semantics else []), *(['--browser-workspace'] if args.browser_workspace else []), *(['--product-flow'] if args.product_flow else []), *(['--login-accounts'] if args.login_accounts else []), *(['--accounts'] if args.accounts else []), *(['--account-center'] if args.account_center else []), *(['--google-login'] if args.google_login else []), *(['--session-backup'] if args.session_backup else []), *(['--proxy-sessions'] if args.proxy_sessions else []), *(['--diagnostics'] if args.diagnostics else [])], cwd=ROOT, env=env, timeout=180)
             if result.returncode:
                 raise RuntimeError("UI flow failed; see isolated ui-error.txt")
             mode = "login account inventory" if args.login_accounts else "session backup" if args.session_backup else "Google login" if args.google_login else "account center" if args.account_center else "proxy session editor" if args.proxy_sessions else "account cards" if args.accounts else "diagnostics" if args.diagnostics else "proxy and environment"

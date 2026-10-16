@@ -88,9 +88,14 @@ public sealed partial class MainWindow
         centerCancel = Button("取消剩余", async () => await CenterSafe(CancelAccountOperation)); centerCancel.IsEnabled = false; centerCancel.Padding = new Thickness(10, 6, 10, 6); activityActions.Children.Add(centerCancel);
         centerResultToggle = Button("展开明细", () => {
             bool show = centerResults.Visibility != Visibility.Visible;
+            CancelFeedbackDismissal(centerActivity);
             centerResults.Visibility = show ? Visibility.Visible : Visibility.Collapsed; centerResultToggle!.Content = show ? "收起明细" : "展开明细";
+            if (!show) ScheduleCenterFeedbackDismissal();
         }); centerResultToggle.Visibility = Visibility.Collapsed; centerResultToggle.Padding = new Thickness(10, 6, 10, 6);
         AutomationProperties.SetName(centerResultToggle, "展开账号结果"); activityActions.Children.Add(centerResultToggle);
+        centerDismiss = IconButton("close", "", () => { if (!centerBusy) { CancelFeedbackDismissal(centerActivity); centerActivity.Visibility = Visibility.Collapsed; } });
+        centerDismiss.Padding = new Thickness(6); centerDismiss.ToolTip = "关闭操作结果提示"; centerDismiss.Background = Brushes.Transparent; centerDismiss.BorderThickness = new Thickness(0);
+        AutomationProperties.SetName(centerDismiss, "关闭环境操作提示"); activityActions.Children.Add(centerDismiss);
         var activityText = new StackPanel { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 16, 0) };
         centerJobText.Foreground = Muted; centerJobText.FontSize = 12; centerJobText.TextWrapping = TextWrapping.Wrap;
         AutomationProperties.SetName(centerJobText, "账号任务进度"); activityText.Children.Add(centerJobText);
@@ -146,8 +151,11 @@ public sealed partial class MainWindow
         void Column(string label, string key, double width) => centerTable.Columns.Add(new DataGridTextColumn { Header = label, Binding = new Binding(key), IsReadOnly = true, Width = new DataGridLength(width / 120, DataGridLengthUnitType.Star), MinWidth = width, ElementStyle = textStyle });
         var identityTemplate = new DataTemplate(); var identity = new FrameworkElementFactory(typeof(StackPanel)); identity.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center); identity.SetValue(FrameworkElement.MarginProperty, new Thickness(14, 0, 14, 0));
         var name = new FrameworkElementFactory(typeof(TextBlock)); name.SetBinding(TextBlock.TextProperty, new Binding("Name")); name.SetValue(TextBlock.FontWeightProperty, FontWeights.SemiBold); name.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis); name.SetBinding(FrameworkElement.ToolTipProperty, new Binding("Name")); identity.AppendChild(name);
-        var email = new FrameworkElementFactory(typeof(TextBlock)); email.SetBinding(TextBlock.TextProperty, new Binding("Email")); email.SetValue(TextBlock.ForegroundProperty, Muted); email.SetValue(TextBlock.FontSizeProperty, 11d); email.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 5, 0, 0)); email.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis); email.SetBinding(FrameworkElement.ToolTipProperty, new Binding("Email")); identity.AppendChild(email); identityTemplate.VisualTree = identity;
-        centerTable.Columns.Add(new DataGridTemplateColumn { Header = "环境 / Google 账号", CellTemplate = identityTemplate, Width = new DataGridLength(2, DataGridLengthUnitType.Star), MinWidth = 180, IsReadOnly = true });
+        var group = new FrameworkElementFactory(typeof(TextBlock)); group.SetBinding(TextBlock.TextProperty, new Binding("Group")); group.SetValue(TextBlock.ForegroundProperty, Muted); group.SetValue(TextBlock.FontSizeProperty, 11d); group.SetValue(FrameworkElement.MarginProperty, new Thickness(0, 5, 0, 0)); group.SetValue(TextBlock.TextTrimmingProperty, TextTrimming.CharacterEllipsis); identity.AppendChild(group); identityTemplate.VisualTree = identity;
+        centerTable.Columns.Add(new DataGridTemplateColumn { Header = "浏览器环境", CellTemplate = identityTemplate, Width = new DataGridLength(1.4, DataGridLengthUnitType.Star), MinWidth = 160, IsReadOnly = true });
+        var accountStyle = new Style(typeof(TextBlock), textStyle); accountStyle.Setters.Add(new Setter(FrameworkElement.ToolTipProperty, new Binding("Email")));
+        centerTable.Columns.Add(new DataGridTextColumn { Header = "关联 Google 账号", Binding = new Binding("Email"), IsReadOnly = true, Width = new DataGridLength(1.8, DataGridLengthUnitType.Star), MinWidth = 210, ElementStyle = accountStyle });
+        centerTable.FrozenColumnCount = 3;
         var healthTemplate = new DataTemplate(); var badge = new FrameworkElementFactory(typeof(Border)); badge.SetValue(FrameworkElement.HorizontalAlignmentProperty, HorizontalAlignment.Left); badge.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
         badge.SetValue(Border.CornerRadiusProperty, new CornerRadius(5)); badge.SetValue(Border.BackgroundProperty, Hex("#24312A")); badge.SetValue(Border.PaddingProperty, new Thickness(8, 5, 8, 5)); badge.SetValue(FrameworkElement.MarginProperty, new Thickness(12, 0, 8, 0));
         var health = new FrameworkElementFactory(typeof(TextBlock)); health.SetBinding(TextBlock.TextProperty, new Binding("Health")); health.SetBinding(TextBlock.ForegroundProperty, new Binding("HealthBrush")); health.SetValue(TextBlock.FontSizeProperty, 11d); badge.AppendChild(health); healthTemplate.VisualTree = badge;
@@ -174,6 +182,7 @@ public sealed partial class MainWindow
     void CenterResultPresentation()
     {
         centerCancel!.Visibility = centerBusy ? Visibility.Visible : Visibility.Collapsed;
+        if (centerDismiss != null) centerDismiss.Visibility = centerBusy ? Visibility.Collapsed : Visibility.Visible;
         centerProgress.Visibility = centerBusy ? Visibility.Visible : Visibility.Collapsed;
         centerJobText.Foreground = centerBusy ? Accent : Muted;
         centerResultToggle!.Visibility = !centerBusy && centerFeedback.Text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;

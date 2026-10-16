@@ -12,6 +12,7 @@ public sealed partial class MainWindow
     readonly ContentControl loginAccountsWorkspace = new() { Visibility = Visibility.Collapsed };
     readonly Dictionary<string, JsonElement> loginAccounts = new();
     readonly TextBox loginAccountSearch = new();
+    readonly ComboBox loginAccountEnterpriseFilter = new() { Width = 145, DisplayMemberPath = "Name", SelectedValuePath = "Id" };
     readonly TextBlock loginAccountCount = new(), loginAccountFeedback = new();
     readonly ContentControl loginAccountSide = new();
     DataGrid? loginAccountTable;
@@ -20,7 +21,7 @@ public sealed partial class MainWindow
     readonly SemaphoreSlim loginAccountsLoadGate = new(1, 1);
     bool loginAccountSelecting, loginAccountSaving;
 
-    sealed record LoginAccountRow(string Id, string Name, string Email, string Group, string Password, string Browser);
+    sealed record LoginAccountRow(string Id, string Name, string Email, string Group, string Password, string Browser, string Enterprise);
 
     async Task LoadLoginAccounts()
     {
@@ -29,6 +30,11 @@ public sealed partial class MainWindow
             var data = await Api("login-accounts");
             loginAccounts.Clear();
             foreach (var item in data.GetProperty("accounts").EnumerateArray()) loginAccounts[Str(item, "id")] = item.Clone();
+            var company = loginAccountEnterpriseFilter.SelectedValue as string ?? "";
+            loginAccountEnterpriseFilter.ItemsSource = new[] { new EnterpriseChoice("", "全部企业 / 来源") }.Concat(loginAccounts.Values.Where(a => Str(a, "workspaceId").Length > 0)
+                .GroupBy(a => Str(a, "workspaceId")).Select(g => new EnterpriseChoice(g.Key, Str(g.First(), "workspaceName")))).ToArray();
+            loginAccountEnterpriseFilter.SelectedValue = company;
+            if (loginAccountEnterpriseFilter.SelectedIndex < 0) loginAccountEnterpriseFilter.SelectedValue = "";
             RenderLoginAccounts();
         } finally { loginAccountsLoadGate.Release(); }
     }
@@ -58,6 +64,8 @@ public sealed partial class MainWindow
         var columns = new Grid(); columns.ColumnDefinitions.Add(new ColumnDefinition()); columns.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); page.Children.Add(columns);
         var list = new DockPanel();
         var toolbar = new DockPanel { Margin = new Thickness(18) };
+        AutomationProperties.SetName(loginAccountEnterpriseFilter, "账号所属企业筛选"); loginAccountEnterpriseFilter.Margin = new Thickness(0, 0, 10, 0);
+        loginAccountEnterpriseFilter.SelectionChanged += (_, _) => RenderLoginAccounts(); DockPanel.SetDock(loginAccountEnterpriseFilter, Dock.Left); toolbar.Children.Add(loginAccountEnterpriseFilter);
         var migrate = Button("迁移已存密码", async () => {
             try {
                 var result = await Api("login-accounts/migrate", new { });
@@ -101,7 +109,7 @@ public sealed partial class MainWindow
         passwordCell.SetValue(FrameworkElement.MarginProperty, new Thickness(14, 0, 14, 0)); passwordCell.SetValue(FrameworkElement.VerticalAlignmentProperty, VerticalAlignment.Center);
         passwordCell.SetValue(AutomationProperties.NameProperty, "账号明文密码");
         loginAccountTable.Columns.Add(new DataGridTemplateColumn { Header = "密码", CellTemplate = new DataTemplate { VisualTree = passwordCell }, MinWidth = 160, Width = new DataGridLength(1.3, DataGridLengthUnitType.Star) });
-        foreach (var (title, key, width) in new[] { ("绑定浏览器", "Browser", 150d), ("分组", "Group", 100d) })
+        foreach (var (title, key, width) in new[] { ("所属企业", "Enterprise", 120d), ("绑定浏览器", "Browser", 150d), ("分组", "Group", 100d) })
             loginAccountTable.Columns.Add(new DataGridTextColumn { Header = title, Binding = new Binding(key), ElementStyle = textStyle, MinWidth = width, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
         loginAccountTable.SelectionChanged += (_, _) => { if (!loginAccountSelecting && !loginAccountSaving && loginAccountTable.SelectedItem is LoginAccountRow row) ShowLoginAccountEditor(row.Id); };
         list.Children.Add(loginAccountTable);
@@ -138,13 +146,14 @@ public sealed partial class MainWindow
     void RenderLoginAccounts()
     {
         if (loginAccountTable == null) return;
-        string signature = JsonSerializer.Serialize(loginAccounts.Values) + loginAccountSearch.Text;
+        string signature = JsonSerializer.Serialize(loginAccounts.Values) + loginAccountSearch.Text + loginAccountEnterpriseFilter.SelectedValue;
         if (signature == loginAccountSignature) return; loginAccountSignature = signature;
         var query = loginAccountSearch.Text.Trim();
-        var rows = loginAccounts.Values.Where(a => query.Length == 0 || new[] { "name", "email", "group", "notes" }.Any(k => Str(a, k).Contains(query, StringComparison.OrdinalIgnoreCase)))
+        string company = loginAccountEnterpriseFilter.SelectedValue as string ?? "";
+        var rows = loginAccounts.Values.Where(a => (company.Length == 0 || Str(a, "workspaceId") == company) && (query.Length == 0 || new[] { "name", "email", "group", "notes", "workspaceName" }.Any(k => Str(a, k).Contains(query, StringComparison.OrdinalIgnoreCase))))
             .Select(a => new LoginAccountRow(Str(a, "id"), Str(a, "name"), Str(a, "email"), Str(a, "group", "未分组"),
-                Str(a, "password"),
-                a.GetProperty("bindings").GetArrayLength() > 0 ? string.Join("、", a.GetProperty("bindings").EnumerateArray().Select(b => Str(b, "name"))) : "未绑定")).ToArray();
+                Str(a, "password").Length > 0 ? Str(a, "password") : "未保存密码",
+                a.GetProperty("bindings").GetArrayLength() > 0 ? string.Join("、", a.GetProperty("bindings").EnumerateArray().Select(b => Str(b, "name"))) : "未绑定", Str(a, "workspaceName", "本机添加").Length > 0 ? Str(a, "workspaceName", "本机添加") : "本机添加")).ToArray();
         loginAccountSelecting = true;
         try { loginAccountTable.ItemsSource = rows; loginAccountTable.SelectedItem = rows.FirstOrDefault(r => r.Id == loginAccountSelected); }
         finally { loginAccountSelecting = false; }
@@ -161,6 +170,12 @@ public sealed partial class MainWindow
         var panel = LoginAccountPanel(id == null ? "添加 Google 账号" : "Google 账号资料", "填写 Google 邮箱和 Google 密码，用于通过 Google 登录 Dola。密码直接显示，可查看、复制和修改。");
         var name = CenterField(panel, "账号名称", Read("name")); name.MaxLength = 120;
         var email = CenterField(panel, "Google 邮箱", Read("email")); email.MaxLength = 254;
+        if (Read("workspaceId").Length > 0) {
+            email.IsReadOnly = true;
+            panel.Children.Add(new TextBlock { Text = "所属企业：" + Read("workspaceName") + "。此处修改密码只更新本机记录；修改 Google 真实密码请进入企业目录执行重置。", Foreground = Muted, FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10) });
+            if (Str(existing, "workspaceMissing").Equals("true", StringComparison.OrdinalIgnoreCase) || Str(existing, "workspaceSuspended").Equals("true", StringComparison.OrdinalIgnoreCase))
+                panel.Children.Add(new TextBlock { Text = "企业目录显示此员工已暂停或已移除，请先核实企业状态。原浏览器和会话保留。", Foreground = Hex("#E8B578"), FontSize = 11, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 10) });
+        }
         var password = CenterField(panel, "Google 密码", Read("password")); password.MaxLength = 4096; loginAccountPassword = password; AutomationProperties.SetName(password, "账号密码");
         var group = CenterField(panel, "账号分组", Read("group")); group.MaxLength = 60;
         var notes = CenterField(panel, "账号备注", Read("notes")); notes.MaxLength = 1000; notes.AcceptsReturn = true; notes.Height = 70; notes.TextWrapping = TextWrapping.Wrap;
@@ -173,7 +188,7 @@ public sealed partial class MainWindow
                 var payload = new Dictionary<string, object?> { ["name"] = name.Text.Trim(), ["email"] = email.Text.Trim(), ["password"] = password.Text, ["group"] = group.Text.Trim(), ["notes"] = notes.Text.Trim() };
                 if (id != null) payload["id"] = id;
                 var saved = await Api("login-accounts", payload); password.Clear(); loginAccountSelected = Str(saved, "id");
-                await LoadLoginAccounts(); await Refresh(); loginAccountFeedback.Text = "账号已保存。可以绑定浏览器并执行自动登录。";
+                await LoadLoginAccounts(); await Refresh(); ShowTemporaryFeedback(loginAccountFeedback, "账号已保存。可以绑定浏览器并执行自动登录。");
                 loginAccountSaving = false; ShowLoginAccountEditor(loginAccountSelected);
             } catch (Exception ex) { error.Text = ex.Message; loginAccountFeedback.Text = "账号操作未完成：" + ex.Message; }
             finally { loginAccountSaving = false; save.IsEnabled = true; }
@@ -203,7 +218,7 @@ public sealed partial class MainWindow
         var actions = new StackPanel();
         var confirm = Button("确认删除账号", async () => {
             if (loginAccountSaving) return; loginAccountSaving = true;
-            try { await Api($"login-accounts/{id}/delete", new { }); await LoadLoginAccounts(); loginAccountSaving = false; ShowLoginAccountEditor(null); loginAccountFeedback.Text = "账号已删除。"; }
+            try { await Api($"login-accounts/{id}/delete", new { }); await LoadLoginAccounts(); loginAccountSaving = false; ShowLoginAccountEditor(null); ShowTemporaryFeedback(loginAccountFeedback, "账号已删除。"); }
             catch (Exception ex) { error.Text = ex.Message; }
             finally { loginAccountSaving = false; }
         }); confirm.Foreground = Hex("#ED9D9D"); actions.Children.Add(confirm);
@@ -228,7 +243,7 @@ public sealed partial class MainWindow
             if (boundId.Length > 0 && target.Length > 0 && target != boundId) { error.Text = "请先选择解除绑定并保存，再绑定新的浏览器。"; return; }
             if (target.Length == 0 && boundId.Length == 0) { ShowLoginAccountEditor(id); return; }
             loginAccountSaving = true;
-            try { await Api($"profiles/{(target.Length > 0 ? target : boundId)}/login-account", new { accountId = target.Length > 0 ? id : "" }); await Refresh(); await LoadLoginAccounts(); loginAccountSaving = false; ShowLoginAccountEditor(id); loginAccountFeedback.Text = "绑定已保存；浏览器内的当前登录身份保持原样。"; }
+            try { await Api($"profiles/{(target.Length > 0 ? target : boundId)}/login-account", new { accountId = target.Length > 0 ? id : "" }); await Refresh(); await LoadLoginAccounts(); loginAccountSaving = false; ShowLoginAccountEditor(id); ShowTemporaryFeedback(loginAccountFeedback, "绑定已保存；浏览器内的当前登录身份保持原样。"); }
             catch (Exception ex) { error.Text = ex.Message; }
             finally { loginAccountSaving = false; }
         }, true); actions.Children.Add(save); var back = Button("返回账号资料", () => ShowLoginAccountEditor(id)); back.Margin = new Thickness(0, 8, 0, 0); actions.Children.Add(back); LoginAccountFooter(panel, actions);

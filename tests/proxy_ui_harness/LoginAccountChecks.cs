@@ -22,7 +22,7 @@ partial class Program
         Named<TextBox>(main, "账号名称").Text = "主账号 · 工作空间"; email.Text = "ui-account@example.invalid"; password.Text = "isolated-account-secret";
         Named<TextBox>(main, "账号分组").Text = "示例项目"; Named<TextBox>(main, "账号备注").Text = "仅用于隔离验证";
         Click(main, "保存账号");
-        await Wait(() => Named<DataGrid>(main, "登录账号列表").Items.Count == 1 && Named<TextBox>(main, "账号密码").Text == "isolated-account-secret");
+        await Wait(() => Named<DataGrid>(main, "登录账号列表").Items.Count == 1 && Nodes<TextBox>(main).Any(t => System.Windows.Automation.AutomationProperties.GetName(t) == "账号密码" && t.Text == "isolated-account-secret"));
         Check("Saved account editor displays plaintext password", Named<TextBox>(main, "账号密码").Text == "isolated-account-secret");
         Check("Account table displays selectable plaintext password", Named<TextBox>(main, "账号明文密码").Text == "isolated-account-secret" && Named<TextBox>(main, "账号明文密码").IsReadOnly);
         using var inventory = JsonDocument.Parse(await client.GetStringAsync("login-accounts")); var record = inventory.RootElement.GetProperty("accounts")[0]; string aid = record.GetProperty("id").GetString()!;
@@ -30,10 +30,10 @@ partial class Program
         Check("Authenticated account inventory provides plaintext password for display", record.GetProperty("passwordSet").GetBoolean() && record.GetProperty("password").GetString() == "isolated-account-secret" && !record.TryGetProperty("protectedPassword", out _));
         Named<TextBox>(main, "账号密码").Text = "updated-account-secret";
         Click(main, "保存账号");
-        await Wait(() => Named<TextBox>(main, "账号明文密码").Text == "updated-account-secret" && Named<TextBox>(main, "账号密码").Text == "updated-account-secret");
+        await Wait(() => Nodes<TextBox>(main).Any(t => System.Windows.Automation.AutomationProperties.GetName(t) == "账号明文密码" && t.Text == "updated-account-secret") && Nodes<TextBox>(main).Any(t => System.Windows.Automation.AutomationProperties.GetName(t) == "账号密码" && t.Text == "updated-account-secret"));
         Check("Password edits update both table and refilled editor", true);
         Named<TextBox>(main, "账号密码").Clear(); Click(main, "保存账号");
-        await Wait(() => Named<TextBox>(main, "账号密码").Text == "updated-account-secret");
+        await Wait(() => Nodes<TextBox>(main).Any(t => System.Windows.Automation.AutomationProperties.GetName(t) == "账号密码" && t.Text == "updated-account-secret"));
         Check("Empty edit preserves saved password and refills plaintext", Named<TextBox>(main, "账号明文密码").Text == "updated-account-secret");
         await Task.Delay(300); Capture(main, Path.Combine(output, "after-save.png"));
         var saveResult = Nodes<TextBlock>(main).FirstOrDefault(t => System.Windows.Automation.AutomationProperties.GetName(t) == "账号保存结果");
@@ -56,7 +56,7 @@ partial class Program
         Check("Account search filters unrelated results", Named<DataGrid>(main, "登录账号列表").Items.Count == 0);
         Named<TextBox>(main, "搜索登录账号").Clear();
         Click(main, "使用绑定账号自动登录");
-        try { await Wait(() => Nodes<Button>(main).Any(b => b.Content as string == "停止自动填写" && b.IsVisible)); }
+        try { await Wait(() => Named<Border>(main, "浏览器登录任务").IsVisible); Click(main, "浏览器 Google 登录设置"); await Wait(() => Nodes<Button>(main).Any(b => b.Content as string == "停止自动填写" && b.IsVisible)); }
         catch { Capture(main, Path.Combine(output, "login-start-failure.png")); throw; }
         Check("Bound login supplies email without a password roundtrip", Named<TextBox>(main, "Google 账号邮箱").Text == "ui-account@example.invalid" && !Named<TextBox>(main, "Google 账号邮箱").IsEnabled && Named<PasswordBox>(main, "Google 密码").Password.Length == 0);
         Check("Bound account password is selected automatically", Named<CheckBox>(main, "使用已保存的 Google 密码").IsChecked == true && !Named<CheckBox>(main, "记住 Google 密码").IsVisible);

@@ -29,7 +29,9 @@ from account_status import OBSERVE_PAGE, classify_observation, checked_result, v
 from account_management import AccountManagement, now
 from google_login import GoogleLoginManager
 from login_accounts import LoginAccounts
+from workspaces import Workspaces
 from session_backup import SessionBackups, MAX_BYTES
+from video_tasks import VideoTasks
 
 
 class ApiError(Exception):
@@ -135,7 +137,9 @@ class BrowserWorker:
         self.accounts = AccountManagement(self, ApiError, validate_profile)
         self.google_login = GoogleLoginManager(self, ApiError)
         self.login_accounts = LoginAccounts(self, ApiError)
+        self.workspaces = Workspaces(self, ApiError)
         self.session_backups = SessionBackups(self, ApiError)
+        self.videos = VideoTasks(self, ApiError)
 
     def save(self):
         temp = self.profile_file.with_suffix(".json.tmp")
@@ -585,6 +589,8 @@ class BrowserWorker:
             return self.state(profile_id)
 
     def shutdown(self):
+        self.videos.close()
+        self.workspaces.close()
         self.session_backups.close()
         self.google_login.close()
         self.accounts.close()
@@ -692,6 +698,16 @@ def make_handler(worker, token):
                             "proxyProtocols": ["http", "https", "socks5"], "proxyTest": True,
                             "proxyCatalog": True, "chainedProxy": True, "batchProxyDiagnostics": True, "perProfileDownloads": True}}
                 with worker.lock:
+                    if parts == ['video-tasks']:
+                        return worker.videos.list()
+                    if parts == ['workspaces']:
+                        return worker.workspaces.list()
+                    if len(parts) == 3 and parts[0] == 'workspaces' and parts[2] == 'users':
+                        return worker.workspaces.users(parts[1])
+                    if len(parts) == 2 and parts[0] == 'workspace-jobs':
+                        return worker.workspaces.snapshot(parts[1])
+                    if len(parts) == 2 and parts[0] == 'workspace-oauth':
+                        return worker.workspaces.oauth_status(parts[1])
                     if parts == ['login-accounts']:
                         return worker.login_accounts.list()
                     if parts == ["proxies"]:
@@ -723,7 +739,7 @@ def make_handler(worker, token):
                 raise ApiError(405, "Method not allowed")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                limit = MAX_BYTES * 2 + 65536 if parts == ['sessions', 'preview'] else 65536
+                limit = MAX_BYTES * 2 + 65536 if parts == ['sessions', 'preview'] else 262144 if parts[:1] == ['workspaces'] else 65536
                 if length < 0 or length > limit:
                     raise ValueError()
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -733,6 +749,28 @@ def make_handler(worker, token):
                 raise ApiError(400, "Expected a JSON object smaller than 64 KiB")
             if parts == ["profiles"]:
                 return worker.create(payload)
+            if parts == ['video-tasks']:
+                return worker.videos.start(payload)
+            if len(parts) == 3 and parts[0] == 'video-tasks':
+                if parts[2] == 'cancel':
+                    return worker.videos.cancel(parts[1])
+                if parts[2] == 'open':
+                    return worker.videos.open(parts[1])
+                if parts[2] == 'delete':
+                    return worker.videos.delete(parts[1])
+            if parts == ['workspaces']:
+                return worker.workspaces.upsert(payload)
+            if len(parts) == 3 and parts[0] == 'workspaces':
+                if parts[2] == 'oauth-start':
+                    return worker.workspaces.oauth_start(parts[1])
+                if parts[2] == 'preview':
+                    return worker.workspaces.preview(parts[1], payload)
+                if parts[2] in ('check', 'sync', 'execute'):
+                    return worker.workspaces.start(parts[1], parts[2], payload)
+            if len(parts) == 3 and parts[0] == 'workspace-jobs' and parts[2] == 'cancel':
+                return worker.workspaces.cancel(parts[1])
+            if len(parts) == 3 and parts[0] == 'workspace-oauth' and parts[2] == 'cancel':
+                return worker.workspaces.oauth_cancel(parts[1])
             if parts == ['login-accounts']:
                 return worker.login_accounts.upsert(payload)
             if parts == ['login-accounts', 'migrate']:

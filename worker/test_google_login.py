@@ -114,6 +114,87 @@ class GoogleLoginTests(unittest.TestCase):
         self.assertEqual(sum(json.dumps(PASSWORD) in e for e in submits), 1)
         self.assertTrue(all(page == 'google' for page, expression in self.calls if 'input.dispatchEvent' in expression))
 
+    def test_navigation_loses_password_reply_without_replaying_submission(self):
+        from google_login import NavigationInterrupted
+        original_run = self.manager._run
+        attempts = []
+        def run(*args):
+            evaluate = self.manager._evaluate
+            def interrupted(rt, page, expression):
+                if 'input.dispatchEvent' in expression and json.dumps(PASSWORD) in expression:
+                    attempts.append(expression)
+                    raise NavigationInterrupted('Execution context destroyed during successful submit')
+                return evaluate(rt, page, expression)
+            self.manager._evaluate = interrupted
+            return original_run(*args)
+        self.manager._run = run
+        job = self.run_flow([{'email': True}, {'password': True}, {'password': True}, {'complete': True}])
+        self.assertEqual((job['state'], job['stage']), ('completed', 'logged_in'))
+        self.assertEqual(len(attempts), 1)
+
+    def test_navigation_observation_recovers_without_false_manual_gate(self):
+        from google_login import DOLA_OBSERVE, GOOGLE_OBSERVE, NavigationInterrupted
+        original_run = self.manager._run
+        interrupted = set()
+        def run(*args):
+            evaluate = self.manager._evaluate
+            def navigating(rt, page, expression):
+                if expression in (DOLA_OBSERVE, GOOGLE_OBSERVE) and expression not in interrupted:
+                    interrupted.add(expression)
+                    raise NavigationInterrupted('Target navigated')
+                return evaluate(rt, page, expression)
+            self.manager._evaluate = navigating
+            return original_run(*args)
+        self.manager._run = run
+        job = self.run_flow([{'email': True}, {'password': True}, {'complete': True}])
+        self.assertEqual(job['stage'], 'logged_in')
+        self.assertEqual(len(interrupted), 2)
+
+    def test_origin_changed_after_target_snapshot_waits_for_fresh_observation(self):
+        from google_login import GOOGLE_OBSERVE
+        self.manager._evaluate = lambda *_: {'trusted': False}
+        self.assertIsNone(self.manager._observe(self.runtime, self.google, GOOGLE_OBSERVE))
+
+    def test_loading_entry_is_reported_until_provider_control_appears(self):
+        from google_login import dola_click_expression
+        original_run = self.manager._run
+        updates, attempts = [], []
+        update = self.manager._update
+        self.manager._update = lambda pid, job, state, stage: (updates.append(stage), update(pid, job, state, stage))[-1]
+        def run(*args):
+            evaluate = self.manager._evaluate
+            def delayed(rt, page, expression):
+                if expression in (dola_click_expression('google'), dola_click_expression('login')):
+                    attempts.append(expression)
+                    if len(attempts) <= 4:
+                        return False
+                return evaluate(rt, page, expression)
+            self.manager._evaluate = delayed
+            return original_run(*args)
+        self.manager._run = run
+        job = self.run_flow([{'email': True}, {'complete': True}])
+        self.assertEqual(job['stage'], 'logged_in')
+        self.assertIn('loading_dola', updates)
+        self.assertNotIn('dola_confirmation', updates)
+
+    def test_disappearing_callback_cannot_mask_main_page_confirmation(self):
+        from google_login import DOLA_OBSERVE, OBSERVE_PAGE, NavigationInterrupted
+        callback = dict(self.google, url='https://www.dola.com/auth/callback')
+        self.manager._evaluate = lambda rt, page, expression: (_ for _ in ()).throw(NavigationInterrupted()) if page['id'] == callback['id'] else ({'trusted': True} if expression == DOLA_OBSERVE else {'url': self.dola['url'], 'ready': 'complete', 'logout': True})
+        self.assertFalse(self.manager._confirm('one', self.runtime, 0, [self.dola, callback]))
+        self.assertTrue(self.manager._confirm('one', self.runtime, 0, [self.dola]))
+
+    def test_resumed_own_oauth_can_confirm_success_but_preexisting_binding_cannot(self):
+        from google_login import DOLA_OBSERVE
+        self.manager._pages = lambda _: [self.dola]
+        self.manager._evaluate = lambda rt, page, ex: {'trusted': True} if ex == DOLA_OBSERVE else {'url': self.dola['url'], 'ready': 'complete', 'logout': True}
+        for attempted, expected in ((False, 'existing_session_unverified'), (True, 'logged_in')):
+            job = {'id': 'resumed', 'state': 'running', 'stage': '', 'cancel': threading.Event(), 'loginAccountId': 'bound', 'oauthStarted': attempted}
+            self.manager.jobs['one'] = job
+            self.manager._run('one', job, self.runtime, 0, EMAIL, None)
+            self.assertEqual(job['stage'], expected)
+            self.assertEqual(self.worker.account_checks['one']['identityStatus'], 'unverified')
+
     def test_captcha_2fa_consent_chooser_and_rejection_pause_without_filling(self):
         for observation, stage in (({'challenge': True, 'password': True}, 'verification_required'),
                                    ({'consent': True, 'email': True}, 'consent_required'),
@@ -158,6 +239,95 @@ class GoogleLoginTests(unittest.TestCase):
         self.manager._evaluate = evaluate
         self.manager._run('one', job, self.runtime, 0, EMAIL, PASSWORD)
         self.assertFalse(any(PASSWORD in expression for _, expression in seen))
+
+    def entry_flow(self, *, opens_after=2, pending=False):
+        from google_login import DOLA_OBSERVE, OBSERVE_PAGE, dola_click_expression
+        job = {'id': 'entry-fixture', 'state': 'running', 'stage': '', 'cancel': threading.Event()}
+        self.manager.jobs['one'] = job
+        clock = [0.0]
+        clicks = [0]
+        self.manager._pages = lambda _: [self.dola] + ([dict(id='pending', url='about:blank')] if pending and clicks[0] else [])
+        def evaluate(rt, page, expression):
+            if expression == DOLA_OBSERVE:
+                return {'trusted': True, 'manual': False}
+            if expression == OBSERVE_PAGE:
+                return {'url': self.dola['url'], 'ready': 'complete', 'logout': clicks[0] >= opens_after, 'login': clicks[0] < opens_after}
+            if expression == dola_click_expression('google'):
+                clicks[0] += 1
+                return True
+            return False
+        self.manager._evaluate = evaluate
+        job['cancel'].wait = lambda seconds: clock.__setitem__(0, clock[0] + seconds) or False
+        with patch('google_login.time.monotonic', side_effect=lambda: clock[0]):
+            self.manager._run('one', job, self.runtime, 0, EMAIL, PASSWORD)
+        return job, clicks[0], clock[0]
+
+    def test_provider_click_without_reaction_is_retried_after_grace(self):
+        job, clicks, elapsed = self.entry_flow()
+        self.assertEqual(job['state'], 'completed')
+        self.assertEqual(clicks, 2)
+        self.assertGreaterEqual(elapsed, 4)
+
+    def test_unresponsive_provider_stops_after_three_entry_attempts(self):
+        job, clicks, elapsed = self.entry_flow(opens_after=99)
+        self.assertEqual(clicks, 3)
+        self.assertEqual(job['stage'], 'google_entry_unresponsive')
+        self.assertGreaterEqual(elapsed, 120)
+
+    def test_manual_provider_click_after_retry_limit_continues_credentials(self):
+        from google_login import DOLA_OBSERVE, GOOGLE_OBSERVE, OBSERVE_PAGE, dola_click_expression
+        job = {'id': 'manual-entry', 'state': 'running', 'stage': '', 'cancel': threading.Event()}
+        self.manager.jobs['one'] = job
+        clock, clicks, submits = [0.0], [], []
+        self.manager._pages = lambda _: [self.dola] + ([self.google] if clock[0] >= 16 else [])
+        def evaluate(rt, page, expression):
+            if expression == DOLA_OBSERVE:
+                return {'trusted': True, 'manual': False}
+            if expression == OBSERVE_PAGE:
+                return {'url': self.dola['url'], 'ready': 'complete', 'logout': len(submits) == 2, 'login': len(submits) < 2}
+            if expression == GOOGLE_OBSERVE:
+                return {'trusted': True, 'email': not submits, 'password': len(submits) == 1}
+            if expression == dola_click_expression('google'):
+                clicks.append(clock[0]); return True
+            if 'input.dispatchEvent' in expression:
+                submits.append(expression); return {'submitted': True}
+            return False
+        self.manager._evaluate = evaluate
+        job['cancel'].wait = lambda seconds: clock.__setitem__(0, clock[0] + seconds) or False
+        with patch('google_login.time.monotonic', side_effect=lambda: clock[0]):
+            self.manager._run('one', job, self.runtime, 0, EMAIL, PASSWORD)
+        self.assertEqual((job['state'], job['stage']), ('completed', 'logged_in'))
+        self.assertEqual(len(clicks), 3)
+        self.assertEqual(len(submits), 2)
+        self.assertEqual(sum(json.dumps(PASSWORD) in expression for expression in submits), 1)
+
+    def test_unrelated_popup_opened_during_loading_is_excluded(self):
+        from google_login import DOLA_OBSERVE, GOOGLE_OBSERVE, OBSERVE_PAGE, dola_click_expression
+        job = {'id': 'delayed-entry', 'state': 'running', 'stage': '', 'cancel': threading.Event()}
+        self.manager.jobs['one'] = job
+        clock, clicks = [0.0], []
+        self.manager._pages = lambda _: [self.dola] + ([self.google] if clock[0] >= 1 else [])
+        def evaluate(rt, page, expression):
+            if expression == GOOGLE_OBSERVE:
+                self.fail('Unrelated popup opened before provider click must not receive credentials')
+            if expression == OBSERVE_PAGE:
+                return {'url': self.dola['url'], 'ready': 'complete', 'login': True}
+            if expression == DOLA_OBSERVE:
+                return {'trusted': True, 'manual': False}
+            if expression == dola_click_expression('google') and clock[0] >= 2:
+                clicks.append(clock[0]); return True
+            return False
+        self.manager._evaluate = evaluate
+        job['cancel'].wait = lambda seconds: clock.__setitem__(0, clock[0] + seconds) or False
+        with patch('google_login.time.monotonic', side_effect=lambda: clock[0]):
+            self.manager._run('one', job, self.runtime, 0, EMAIL, PASSWORD)
+        self.assertEqual(len(clicks), 3)
+        self.assertEqual(job['stage'], 'google_entry_unresponsive')
+
+    def test_pending_popup_never_causes_duplicate_provider_windows(self):
+        job, clicks, _ = self.entry_flow(opens_after=99, pending=True)
+        self.assertEqual(clicks, 1)
+        self.assertEqual(job['stage'], 'timeout')
 
     def test_paused_google_popup_can_resume_after_user_selects_account(self):
         job = self.run_flow([{'password': True}, {'complete': True}], existing_google=True, resume='google')

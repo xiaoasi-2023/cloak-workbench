@@ -32,6 +32,8 @@ public sealed partial class MainWindow
         foreach (var (icon, key, label, callback) in new (string, string, string, Action)[] {
             ("browser", "环境工作台", "浏览器", ShowBrowserPage),
             ("accounts", "账号列表", "账号列表", ShowLoginAccounts),
+            ("accounts", "企业目录", "企业目录", ShowEnterprises),
+            ("browser", "视频生成", "视频生成", ShowVideoPage),
             ("settings", "批量管理", "环境管理", ShowAccountCenter),
             ("settings", "代理管理", "代理管理", ShowProxyPage),
             ("diagnostic", "运行诊断", "运行诊断", ShowDiagnostics) }) {
@@ -47,6 +49,8 @@ public sealed partial class MainWindow
         Grid.SetColumn(diagnosticsWorkspace, 1); root.Children.Add(diagnosticsWorkspace);
         Grid.SetColumn(accountWorkspace, 1); root.Children.Add(accountWorkspace);
         Grid.SetColumn(loginAccountsWorkspace, 1); root.Children.Add(loginAccountsWorkspace);
+        Grid.SetColumn(enterpriseWorkspace, 1); root.Children.Add(enterpriseWorkspace);
+        Grid.SetColumn(videoWorkspace, 1); root.Children.Add(videoWorkspace);
         Grid.SetColumn(profileSettingsWorkspace, 1); root.Children.Add(profileSettingsWorkspace);
         var body = new Grid(); body.ColumnDefinitions.Add(runningSidebarColumn); body.ColumnDefinitions.Add(new ColumnDefinition()); workspace.Children.Add(body);
         var accounts = new DockPanel();
@@ -83,7 +87,9 @@ public sealed partial class MainWindow
         address.Background = Hex("#0C100E"); address.Foreground = Text; address.BorderBrush = Line; address.Padding = new Thickness(10, 6, 10, 6); address.FontFamily = new FontFamily("Segoe UI"); address.FontSize = 12; address.Margin = new Thickness(2, 0, 8, 0);
         address.KeyDown += async (_, e) => { if (e.Key == Key.Enter) await Guard(Navigate); }; AutomationProperties.SetName(address, "AddressBar"); toolbar.Children.Add(address); browserCommands.Add(address);
         browserContext.FontSize = 11; browserContext.Foreground = Muted; browserContext.Margin = new Thickness(14, 0, 14, 0); browserContext.VerticalAlignment = VerticalAlignment.Center; browserContext.TextTrimming = TextTrimming.CharacterEllipsis; AutomationProperties.SetName(browserContext, "当前浏览器环境摘要"); Grid.SetRow(browserContext, 2); browser.Children.Add(browserContext);
-        viewport.Background = Bg; Grid.SetRow(viewport, 3); browser.Children.Add(viewport);
+        browser.RowDefinitions.Insert(3, new RowDefinition { Height = GridLength.Auto });
+        var loginActivity = CreateBrowserLoginActivity(); Grid.SetRow(loginActivity, 3); browser.Children.Add(loginActivity);
+        viewport.Background = Bg; Grid.SetRow(viewport, 4); browser.Children.Add(viewport);
         browserPlaceholder.HorizontalContentAlignment = HorizontalAlignment.Stretch; browserPlaceholder.VerticalContentAlignment = VerticalAlignment.Stretch; viewport.Children.Add(browserPlaceholder); UpdateBrowserPresentation();
         Grid.SetColumn(browser, 1); body.Children.Add(browser);
         status.Text = "就绪"; status.Foreground = Muted; status.FontSize = 11; status.TextTrimming = TextTrimming.CharacterEllipsis; status.Margin = new Thickness(14, 0, 14, 0); status.VerticalAlignment = VerticalAlignment.Center; Grid.SetRow(status, 1); Grid.SetColumn(status, 1); root.Children.Add(status); Content = root;
@@ -171,7 +177,7 @@ public sealed partial class MainWindow
         var footer = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) }; DockPanel.SetDock(footer, Dock.Bottom); layout.Children.Add(footer);
         var fields = new StackPanel(); layout.Children.Add(new ScrollViewer { Content = fields, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
         TextBox Field(string key, string label, string fallback = "") { fields.Children.Add(Label(label, 12)); var input = new TextBox { Text = Read(key, fallback), Margin = new Thickness(0, 7, 0, 16) }; AutomationProperties.SetName(input, label); fields.Children.Add(input); return input; }
-        var name = Field("name", "环境名称", "浏览器 " + (profiles.Count + 1));
+        var name = Field("name", "环境名称", id == null ? SuggestEnvironmentName() : "");
         var email = Field("accountEmail", "旧版标识（仅备注，可选）"); email.ToolTip = "此字段只保留旧版资料。自动登录使用绑定账号的邮箱和密码。";
         var group = Field("accountGroup", "分组（可选）");
         var notes = Field("accountNotes", "备注（可选）"); notes.AcceptsReturn = true; notes.TextWrapping = TextWrapping.Wrap; notes.Height = 70;
@@ -181,6 +187,12 @@ public sealed partial class MainWindow
         dialog.Closed += (_, _) => { dialogClosed = true; ++detectionVersion; };
         if (id == null) {
             loginAccountPicker = LoginAccountPicker(fields, null);
+            string automaticName = name.Text;
+            loginAccountPicker.SelectionChanged += (_, _) => {
+                if (string.IsNullOrWhiteSpace(name.Text) || name.Text == automaticName) {
+                    automaticName = SuggestEnvironmentName(loginAccountPicker.SelectedValue as string); name.Text = automaticName;
+                }
+            };
             fields.Children.Add(Label("网络代理", 12));
             proxy = new ComboBox { ItemsSource = new[] { new ProxyChoice("", "本机直连") }.Concat(proxyCatalog.Select(entry => new ProxyChoice(Str(entry, "id"), Str(entry, "name")))).ToList(), DisplayMemberPath = "Label", SelectedValuePath = "Id", SelectedValue = "", MinHeight = 36, Margin = new Thickness(0, 7, 0, 10), Foreground = Text, Background = Panel };
             AutomationProperties.SetName(proxy, "账号代理选择"); fields.Children.Add(proxy);
@@ -209,7 +221,10 @@ public sealed partial class MainWindow
         var error = new TextBlock { Foreground = Hex("#ED9D9D"), TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 12, 0, 0) }; fields.Children.Add(error);
         save = Button(id == null ? "创建浏览器" : "保存环境资料", async () => {
             if (detecting || dialogClosed) return;
-            if (name.Text.Trim().Length == 0) { error.Text = "请填写环境名称。"; name.Focus(); return; }
+            if (name.Text.Trim().Length == 0) {
+                if (id == null) name.Text = SuggestEnvironmentName(loginAccountPicker?.SelectedValue as string);
+                else { error.Text = "请填写环境名称。"; name.Focus(); return; }
+            }
             save!.IsEnabled = false; error.Text = "";
             try {
                 var body = new Dictionary<string, object?> { ["name"] = name.Text.Trim(), ["accountEmail"] = email.Text.Trim(), ["accountGroup"] = group.Text.Trim(), ["accountNotes"] = notes.Text.Trim() };

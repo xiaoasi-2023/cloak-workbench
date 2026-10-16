@@ -1,6 +1,6 @@
 """User-started Google OAuth helper for existing owned browser environments.
 
-No hidden login retries, OTP generation or CAPTCHA handling.
+Only bounded entry-button retries; no credential replay, OTP or CAPTCHA handling.
 Public job records contain stage codes only, never credentials or page content.
 """
 import copy
@@ -12,8 +12,16 @@ import uuid
 from urllib.parse import urlsplit
 
 from websockets.sync.client import connect
+from websockets.exceptions import ConnectionClosed
 from account_status import OBSERVE_PAGE, checked_result, classify_observation
 from google_credentials import GoogleCredentialStore
+
+
+class NavigationInterrupted(RuntimeError):
+    """A CDP target or execution context changed during navigation."""
+
+
+TRANSIENT_BROWSER_ERRORS = (NavigationInterrupted, ConnectionClosed, OSError, TimeoutError)
 
 
 def trusted_google(url):
@@ -41,16 +49,18 @@ GOOGLE_OBSERVE = r'''(() => {
   const has=s=>[...document.querySelectorAll(s)].some(visible);
   const text=(document.body?.innerText||'').slice(0,16000);
   const path=location.pathname.toLowerCase();
+  const email=has('#identifierId'), password=has('input[name="Passwd"]');
   const challenge=has('input[type="tel"],input[name="totpPin"],input[name="Pin"],input[autocomplete="one-time-code"],iframe[src*="recaptcha"],input[name="ca"]')
     || /\/challenge\/(?!pwd(?:\/|$))/.test(path)
-    || /verify it.s you|two.step verification|2.step verification|验证码|两步验证|確認コード|2 段階認証|check your phone|查看手机/i.test(text);
+    || /two.step verification|2.step verification|验证码|两步验证|確認コード|2 段階認証|check your phone|查看手机/i.test(text)
+    || (!email&&!password&&/verify it.s you/i.test(text));
   const welcome=path==='/v3/signin/speedbump/workspacetermsofservice';
   const consent=/\/consent|\/oauth.*\/approval|\/signin\/oauth\/id(?:\/|$)/.test(path)||has('#submit_button')
     || /wants access to|wants to access|アクセスを求め|请求访问|权限授权/i.test(text);
   const error=has('input[aria-invalid="true"], [data-error-code]')
     || /wrong password|couldn.t sign you in|couldn.t find your google account|this browser or app may not be secure|密码错误|找不到.*Google.*账号|パスワードが正しくありません|ブラウザ.*安全/i.test(text);
   return {trusted:true,ready:document.readyState,challenge,consent,welcome,error,
-          email:has('#identifierId'),password:has('input[name="Passwd"]'),
+          email,password,
           chooser:/accountchooser/i.test(path)};
 })()'''
 
@@ -61,7 +71,7 @@ DOLA_OBSERVE = r'''(() => {
   const age=/age verification|confirm your age|verify your age|年齢(?:を)?確認|年龄确认|确认.*年龄/i.test(text);
   const security=[...document.querySelectorAll('iframe[src*="captcha"],input[autocomplete="one-time-code"]')].some(visible)
     || /verify you are human|人机验证/i.test(text);
-  return {trusted:true,age,security,manual:age||security};
+  return {trusted:true,ready:document.readyState,age,security,manual:age||security};
 })()'''
 
 
@@ -144,13 +154,34 @@ def google_submit_expression(stage, value, email):
 
 
 def dola_click_expression(kind):
-    matcher = r'/^(?:continue with google|sign in with google|log in with google|Google\s?で続ける|(?:使用|通过)\s?Google\s?(?:继续|登录)|继续使用\s?Google|Google로 계속하기|Google)$/i' if kind == 'google' else r'/^(log\s?in|sign\s?in|登录|登入|ログイン|로그인)$/i'
+    matcher = r'/^(?:continue with google|sign in with google|log in with google|Google\s*(?:sign\s?in|log\s?in|登录|登入|登錄|繼續|继续)|Google\s*で\s*(?:続ける|ログイン)|(?:使用|通过|透過|通過)\s*Google\s*(?:继续|繼續|登录|登入|登錄)|(?:继续|繼續)使用\s*Google|Google로 계속하기|Google)$/i' if kind == 'google' else r'/^(log\s?in|sign\s?in|登录|登入|登錄|ログイン|로그인)$/i'
     return r'''(() => {
       if(location.protocol!=='https:'||!(location.hostname==='dola.com'||location.hostname.endsWith('.dola.com')))return false;
-      const visible=e=>!!(e&&e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden');
-      const nodes=[...document.querySelectorAll('button,a,[role="button"],[class*="login-btn-header"]')];
-      const match=nodes.find(e=>visible(e)&&MATCHER.test((e.innerText||e.getAttribute('aria-label')||'').trim()));
-      if(!match)return false; match.click(); return true;
+      const visible=e=>!!(e&&e.getClientRects().length&&getComputedStyle(e).visibility!=='hidden'&&getComputedStyle(e).opacity!=='0');
+      const nodes=[...document.querySelectorAll('button,a,[role="button"],[class*="login-btn-header"],div,span')];
+      const label=e=>(e.innerText||e.getAttribute('aria-label')||'').replace(/[\u200b-\u200f\ufeff]/g,'').replace(/\s+/g,' ').trim();
+      const matcher=MATCHER;
+      let matches=nodes.filter(e=>{
+        if(!visible(e)||e.closest('[disabled],[aria-disabled="true"],[inert]')||!matcher.test(label(e)))return false;
+        const owner=e.closest('button,a,[role="button"]');
+        if(owner&&!matcher.test(label(owner)))return false;
+        // A bare logo label inside a download card is not a sign-in option.
+        return !/^Google$/i.test(label(e))||!!owner;
+      });
+      // Header shortcuts can remain in the DOM beneath the sign-in dialog.
+      // Prefer dialog controls and never dispatch through a covering overlay.
+      const dialogs=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],.arco-modal,[class*="modal-content"],[class*="login-modal"]')].filter(visible);
+      const inDialog=matches.filter(e=>dialogs.some(d=>d.contains(e)));
+      if(inDialog.length)matches=inDialog;
+      matches=matches.filter(e=>{
+        const rect=e.getBoundingClientRect(), x=rect.left+rect.width/2, y=rect.top+rect.height/2;
+        const top=document.elementFromPoint(x,y);
+        return top&&(e===top||e.contains(top)||top.contains(e));
+      });
+      // Dola also renders its provider choice as nested div/span controls.
+      // Click the unique innermost match so its event can bubble to the owner.
+      const leaves=matches.filter(e=>!matches.some(other=>other!==e&&e.contains(other)));
+      if(leaves.length!==1)return false; leaves[0].click(); return true;
     })()'''.replace('MATCHER', matcher)
 
 
@@ -210,6 +241,8 @@ class GoogleLoginManager:
             old = self.jobs.get(pid)
             if old and old['state'] in self.ACTIVE:
                 raise self.error(409, '此账号的登录正在进行，请勿重复提交。')
+            if getattr(self.worker, 'videos', None) and self.worker.videos.busy(pid):
+                raise self.error(409, '此环境有视频任务，请先停止视频任务再登录。')
             if sum(j['state'] in self.ACTIVE for j in self.jobs.values()) >= 3:
                 raise self.error(409, '最多同时处理三个登录，请等待当前任务完成。')
             runtime = self.worker.runtime.get(pid)
@@ -225,6 +258,12 @@ class GoogleLoginManager:
             if not isinstance(email, str) or not isinstance(password, str):
                 raise self.error(400, '请填写 Google 邮箱与密码。')
             email = email.strip()
+            if getattr(self.worker, 'workspaces', None) and self.worker.workspaces.account_busy(email):
+                raise self.error(409, '此邮箱正在执行企业任务，请等待任务结束后登录。')
+            inventory = getattr(self.worker, 'login_accounts', None)
+            saved_account = next((a for a in inventory.entries.values() if a['email'].casefold() == email.casefold()), None) if inventory else None
+            if saved_account and (inventory._enterprise_busy(saved_account) or saved_account.get('workspaceSuspended') or saved_account.get('workspaceMissing')):
+                raise self.error(409, '此企业正在执行任务、员工已暂停或目录已无此员工，请核实企业目录后登录。')
             bound = self.worker.login_accounts.bound(pid)
             if bound and email.casefold() != bound['email'].casefold():
                 raise self.error(400, '登录邮箱与绑定账号不一致，请先修改绑定。')
@@ -270,6 +309,8 @@ class GoogleLoginManager:
     def resume(self, pid, payload):
         with self.worker.lock:
             self.worker.profile(pid)
+            if getattr(self.worker, 'videos', None) and self.worker.videos.busy(pid):
+                raise self.error(409, '此环境有视频任务，请先停止视频任务再继续登录。')
             if any(k not in ('allowOnboarding', 'ageConfirmed') for k in payload):
                 raise self.error(400, '继续请求包含不支持的字段。')
             options = self._options(payload)
@@ -310,6 +351,9 @@ class GoogleLoginManager:
                 result = json.loads(ws.recv(timeout=max(.1, deadline - time.monotonic())))
                 if result.get('id') == 1:
                     if 'error' in result:
+                        message = str(result['error'].get('message', '')).lower()
+                        if any(text in message for text in ('execution context', 'cannot find context', 'target closed', 'session closed', 'inspected target navigated')):
+                            raise NavigationInterrupted('Browser page is navigating')
                         raise RuntimeError('Browser command failed')
                     return result.get('result', {})
         raise TimeoutError('Browser command timed out')
@@ -323,19 +367,42 @@ class GoogleLoginManager:
     def _pages(self, runtime):
         return [p for p in self.worker.cdp_json(runtime['cdpPort'], '/json/list') if p.get('type') == 'page']
 
+    def _observe(self, runtime, page, expression):
+        # Reads are safe to repeat on the next fresh target snapshot. A closing
+        # OAuth popup or replaced execution context is not a failed login.
+        try:
+            value = self._evaluate(runtime, page, expression)
+            # Origin can change between /json/list and Runtime.evaluate. Wait
+            # for a fresh trusted target snapshot instead of flagging a normal
+            # Google -> Dola redirect as a page error; no actions run here.
+            return None if isinstance(value, dict) and value.get('trusted') is False else value
+        except TRANSIENT_BROWSER_ERRORS:
+            return None
+
+    def _act(self, runtime, page, expression, uncertain):
+        try:
+            return self._evaluate(runtime, page, expression)
+        except TRANSIENT_BROWSER_ERRORS:
+            # The click may have reached Chromium before the target vanished.
+            # Treat it as attempted and observe the next page; never replay a
+            # password/consent click merely because its reply was lost.
+            return uncertain
+
     def _confirm(self, pid, runtime, generation, pages, job=None):
         eligible = []
         for page in pages:
             if not trusted_dola(page.get('url', '')):
                 continue
-            gate = self._evaluate(runtime, page, DOLA_OBSERVE)
+            gate = self._observe(runtime, page, DOLA_OBSERVE)
+            if gate is None:
+                return False
             if not isinstance(gate, dict) or not gate.get('trusted'):
                 continue
             if gate.get('manual'):
                 return False
             eligible.append(page)
         for page in eligible:
-            observation = self._evaluate(runtime, page, OBSERVE_PAGE)
+            observation = self._observe(runtime, page, OBSERVE_PAGE)
             if not isinstance(observation, dict):
                 continue
             status, reason = classify_observation(observation)
@@ -375,6 +442,8 @@ class GoogleLoginManager:
         onboarding_clicked = set()
         options = job.get('options', {})
         clicked_login = clicked_google = False
+        entry_attempts = {'login': 0, 'google': 0}
+        entry_last = {'login': float('-inf'), 'google': float('-inf')}
         google_target = resume_target
         try:
             if job['cancel'].is_set() or not self._valid(pid, runtime, generation):
@@ -396,10 +465,10 @@ class GoogleLoginManager:
             if self._confirm(pid, runtime, generation, [p for p in pages if p['id'] in (initial['id'], google_target)], job):
                 # A configured binding is not proof of the website's existing
                 # identity. Never present a skipped login as an account switch.
-                if job.get('loginAccountId'):
+                if job.get('loginAccountId') and not job.get('oauthStarted'):
                     self._update(pid, job, 'needs_attention', 'existing_session_unverified')
                 else:
-                    self._update(pid, job, 'completed', 'already_logged_in')
+                    self._update(pid, job, 'completed', 'logged_in' if job.get('oauthStarted') else 'already_logged_in')
                 return
             if not trusted_dola(initial.get('url', '')) and not trusted_google(initial.get('url', '')):
                 # Do not navigate an unrelated document or discard an unsaved draft.
@@ -411,7 +480,11 @@ class GoogleLoginManager:
                     self._update(pid, job, 'cancelled', 'cancelled'); return
                 if not self._valid(pid, runtime, generation):
                     self._update(pid, job, 'cancelled', 'session_changed'); return
-                pages = self._pages(runtime)
+                try:
+                    pages = self._pages(runtime)
+                except TRANSIENT_BROWSER_ERRORS:
+                    self._update(pid, job, 'running', 'waiting_dola' if google_target else 'loading_dola')
+                    job['cancel'].wait(.5); continue
                 if self._confirm(pid, runtime, generation, [p for p in pages if p['id'] in (initial['id'], google_target)], job):
                     self._update(pid, job, 'completed', 'logged_in'); return
                 candidates = [p for p in pages if trusted_google(p.get('url', ''))]
@@ -426,7 +499,9 @@ class GoogleLoginManager:
                         job['targetId'] = google_target
                 google = next((p for p in candidates if p['id'] == google_target), None)
                 if google:
-                    observation = self._evaluate(runtime, google, GOOGLE_OBSERVE)
+                    observation = self._observe(runtime, google, GOOGLE_OBSERVE)
+                    if observation is None:
+                        self._update(pid, job, 'running', 'waiting_google'); job['cancel'].wait(.5); continue
                     if not isinstance(observation, dict) or not observation.get('trusted'):
                         self._update(pid, job, 'needs_attention', 'page_changed'); return
                     if observation.get('error'):
@@ -442,7 +517,7 @@ class GoogleLoginManager:
                         self._update(pid, job, 'running', 'confirming_workspace' if onboarding == 'welcome' else 'authorizing_dola')
                         if onboarding not in onboarding_clicked:
                             if job['cancel'].is_set() or not self._valid(pid, runtime, generation): continue
-                            result = self._evaluate(runtime, google, onboarding_expression(onboarding, email))
+                            result = self._act(runtime, google, onboarding_expression(onboarding, email), {'clicked': True})
                             if isinstance(result, dict) and result.get('reason') == 'not_ready':
                                 self._update(pid, job, 'running', 'waiting_google'); job['cancel'].wait(1); continue
                             if not isinstance(result, dict) or not result.get('clicked'):
@@ -458,9 +533,10 @@ class GoogleLoginManager:
                         if job['cancel'].is_set() or not self._valid(pid, runtime, generation):
                             continue
                         self._update(pid, job, 'running', 'submitting_' + stage)
-                        response = self._evaluate(runtime, google, google_submit_expression(stage, email if stage == 'email' else password, email))
+                        response = self._act(runtime, google, google_submit_expression(stage, email if stage == 'email' else password, email), {'submitted': True})
                         if response and response.get('submitted'):
                             submitted.add(stage)
+                            job['oauthStarted'] = True
                         elif response and response.get('reason') in ('account_mismatch', 'verification_required', 'consent_required', 'workspace_welcome_required', 'choose_account', 'google_rejected'):
                             self._update(pid, job, 'needs_attention', response['reason']); return
                     elif stage and stage in submitted:
@@ -476,17 +552,19 @@ class GoogleLoginManager:
                         if google_target is not None:
                             self._update(pid, job, 'running', 'waiting_dola'); job['cancel'].wait(1); continue
                         self._update(pid, job, 'needs_attention', 'page_changed'); return
-                    account = self._evaluate(runtime, dola, OBSERVE_PAGE)
+                    account = self._observe(runtime, dola, OBSERVE_PAGE)
                     if isinstance(account, dict) and classify_observation(account)[0] == 'region_blocked':
                         self._update(pid, job, 'needs_attention', 'region_blocked'); return
-                    view = self._evaluate(runtime, dola, DOLA_OBSERVE)
+                    view = self._observe(runtime, dola, DOLA_OBSERVE)
+                    if view is None:
+                        self._update(pid, job, 'running', 'waiting_dola' if google_target else 'loading_dola'); job['cancel'].wait(.5); continue
                     if isinstance(view, dict) and view.get('trusted') and view.get('age') and not view.get('security'):
                         if not options.get('ageConfirmed'):
                             self._update(pid, job, 'needs_attention', 'age_confirmation_required'); return
                         self._update(pid, job, 'running', 'confirming_age')
                         if 'age' not in onboarding_clicked:
                             if job['cancel'].is_set() or not self._valid(pid, runtime, generation): continue
-                            result = self._evaluate(runtime, dola, onboarding_expression('age', email))
+                            result = self._act(runtime, dola, onboarding_expression('age', email), {'clicked': True})
                             if not isinstance(result, dict) or not result.get('clicked'):
                                 self._update(pid, job, 'needs_attention', (result or {}).get('reason', 'age_confirmation_required')); return
                             onboarding_clicked.add('age')
@@ -495,14 +573,44 @@ class GoogleLoginManager:
                         self._update(pid, job, 'needs_attention', 'dola_confirmation'); return
                     if google_target is not None:
                         self._update(pid, job, 'running', 'waiting_dola'); job['cancel'].wait(1); continue
-                    if not clicked_google:
-                        initial_ids = {p['id'] for p in pages}
-                        clicked_google = self._evaluate(runtime, dola, dola_click_expression('google')) is True
-                    if not clicked_google and not clicked_login:
-                        clicked_login = self._evaluate(runtime, dola, dola_click_expression('login')) is True
-                    self._update(pid, job, 'running', 'waiting_google' if clicked_google else 'opening_dola')
-                job['cancel'].wait(1)
-            self._update(pid, job, 'needs_attention', 'timeout')
+                    now = time.monotonic()
+                    # A DOM click is not proof that React handled it. Recheck the
+                    # same exposed entry after a grace period, at most 3 times.
+                    # New blank popups may still be navigating to Google: wait
+                    # rather than opening a second provider window.
+                    pending_popup = any(p['id'] not in initial_ids and p.get('url', '') in ('', 'about:blank') for p in pages)
+                    for kind in ('google', 'login'):
+                        if kind == 'login' and clicked_google:
+                            break
+                        if pending_popup or entry_attempts[kind] >= 3 or now - entry_last[kind] < 4:
+                            continue
+                        if job['cancel'].is_set() or not self._valid(pid, runtime, generation):
+                            break
+                        # Snapshot before the first provider click, after any
+                        # unrelated windows opened while Dola was still loading.
+                        # Never absorb our own popup into this baseline on retry.
+                        before_click_ids = {p['id'] for p in pages} if kind == 'google' and not clicked_google else None
+                        attempted = self._act(runtime, dola, dola_click_expression(kind), True) is True
+                        if attempted:
+                            entry_attempts[kind] += 1
+                            entry_last[kind] = now
+                            if kind == 'google':
+                                if before_click_ids is not None:
+                                    initial_ids = before_click_ids
+                                clicked_google = True
+                                job['oauthStarted'] = True
+                            else:
+                                clicked_login = True
+                            break
+                    if entry_attempts['google'] >= 3 and now - entry_last['google'] >= 4:
+                        # Stop clicking but keep observing within this job's
+                        # deadline, so a manual provider click can still finish
+                        # with the credentials held only by this running call.
+                        self._update(pid, job, 'running', 'google_entry_waiting_manual')
+                    else:
+                        self._update(pid, job, 'running', 'waiting_google' if clicked_google else 'locating_google' if clicked_login else 'loading_dola')
+                job['cancel'].wait(.5)
+            self._update(pid, job, 'needs_attention', 'google_entry_unresponsive' if google_target is None and entry_attempts['google'] >= 3 else 'timeout')
         except Exception:
             # Exception strings may contain script source/passwords; never log
             # or return them. The user can inspect the visible browser instead.
