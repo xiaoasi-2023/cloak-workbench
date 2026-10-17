@@ -1,3 +1,4 @@
 websockets>=14,<17
 tzdata>=2025.1
 google-auth[requests]>=2.40,<3
+cryptography>=46,<51

@@ -1,6 +1,8 @@
 # 栖航工作台：Windows 正式发布方案（草案）
 
-日期：2026-10-16。当前项目名 Cloak Workbench，暂拟发布名“栖航工作台 / Qihang Workbench”。本文件是基于现有代码的实施规划；品牌源文件已拟定，安装器、组件管理与跨电脑迁移尚未实现。
+日期：2026-10-16。当前项目名 Cloak Workbench，暂拟发布名“栖航工作台 / Qihang Workbench”。本文件保留最初完整规划；根据后续要求，当前先实现内置运行库和内核的简单内部离线安装版，具体操作见 `release/README.md`。组件管理平台与跨电脑迁移仍属于后续规划。
+
+**当前实际交付：** `Qihang-Setup-0.1.0-beta.2-win-x64.exe` 是内置 Python、.NET 运行库及完整 CloakBrowser 内核的离线安装包，内容对应下表原定的 `Offline` 方案。为了保持安装入口一致，仍沿用 `Setup` 文件名。下表为早期规划，不代表目前存在三个发布物；在线精简包、独立内核组件包均未实现。新版同时提供企业授权、代理及可选账号和环境设置的跨电脑配置备份与恢复。
 
 ## 1. 建议采用的方案
 
@@ -149,4 +151,4 @@ EXE 文件属性、标题栏、开始菜单、安装器和卸载项统一从发�
 - 内核许可：https://github.com/CloakHQ/CloakBrowser/blob/main/BINARY-LICENSE.md
 - .NET 支持周期：https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core
 
-当前交付范围：发布规划、品牌元数据草案、SVG / PNG / ICO 图标；尚未生成或发布安装包，也未改动现有运行程序或个人数据。
+本文件最初交付范围为发布规划与品牌草案；后续已简化实施内部离线安装版，安装包、运行验证和构建方法以 `release/README.md` 为准。没有公开分发内核或将开发机个人数据放入安装包。

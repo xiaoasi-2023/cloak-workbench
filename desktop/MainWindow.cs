@@ -16,7 +16,7 @@ public sealed partial class MainWindow : Window
 {
     static readonly Brush Bg = Hex("#141716"), Panel = Hex("#1B201E"), Line = WorkbenchTheme.Border;
     static readonly Brush Text = WorkbenchTheme.Ink, Muted = WorkbenchTheme.Muted, Accent = WorkbenchTheme.Blue;
-    readonly HttpClient api = new() { BaseAddress = new Uri("http://127.0.0.1:8766/"), Timeout = TimeSpan.FromSeconds(40) };
+    readonly HttpClient api = new() { BaseAddress = new Uri(Environment.GetEnvironmentVariable("CLOAK_WORKBENCH_API_URL") ?? "http://127.0.0.1:8766/"), Timeout = TimeSpan.FromSeconds(40) };
     readonly StackPanel accountList = new(), tabs = new() { Orientation = Orientation.Horizontal };
     readonly Grid viewport = new();
     readonly ColumnDefinition runningSidebarColumn = new() { Width = new GridLength(236) };
@@ -54,7 +54,7 @@ public sealed partial class MainWindow : Window
         var token = Environment.GetEnvironmentVariable("CLOAK_WORKBENCH_TOKEN") ?? "";
         if (token.Length == 0) throw new InvalidOperationException("Use start-workbench.bat to launch the application.");
         api.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        Title = "Cloak Workbench · 多账号工作台";
+        Title = Environment.GetEnvironmentVariable("CLOAK_WORKBENCH_DISPLAY_NAME") ?? "Cloak Workbench · 多账号工作台";
         Width = 1440; Height = 900; MinWidth = 1050; MinHeight = 680;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = Bg; Foreground = Text; WorkbenchTheme.Apply(this);
@@ -119,11 +119,13 @@ public sealed partial class MainWindow : Window
         enterpriseWorkspace.Visibility = page == enterpriseWorkspace ? Visibility.Visible : Visibility.Collapsed;
         videoWorkspace.Visibility = page == videoWorkspace ? Visibility.Visible : Visibility.Collapsed;
         profileSettingsWorkspace.Visibility = page == profileSettingsWorkspace ? Visibility.Visible : Visibility.Collapsed;
+        configurationWorkspace.Visibility = page == configurationWorkspace ? Visibility.Visible : Visibility.Collapsed;
         UpdateNavigation();
         page.Focus();
     }
     void ShowBrowserPage()
     {
+        configurationWorkspace.Visibility = Visibility.Collapsed;
         videoWorkspace.Visibility = Visibility.Collapsed;
         enterpriseWorkspace.Visibility = Visibility.Collapsed;
         currentPage = "环境工作台";
@@ -288,6 +290,7 @@ public sealed partial class MainWindow : Window
     }
     void Select(string id)
     {
+        configurationWorkspace.Visibility = Visibility.Collapsed;
         videoWorkspace.Visibility = Visibility.Collapsed;
         enterpriseWorkspace.Visibility = Visibility.Collapsed;
         currentPage = "环境工作台";
@@ -428,7 +431,7 @@ public sealed partial class MainWindow : Window
             ("demo-a", "测试环境 A · 东京", "ja-JP", "Asia/Tokyo", 24681),
             ("demo-b", "测试环境 B · 首尔", "ko-KR", "Asia/Seoul", 75319) }) {
             if (!profiles.ContainsKey(id)) await Api("profiles", new { id, name, locale, timezone, seed, proxy = "", screenWidth = 1280, screenHeight = 800,
-                startUrl = $"http://127.0.0.1:8766/probe?profile={id}" });
+                startUrl = $"{api.BaseAddress}probe?profile={id}" });
         }
         await Refresh(); Log("已创建两个本地测试环境；测试页面不会访问账号网站。");
     }

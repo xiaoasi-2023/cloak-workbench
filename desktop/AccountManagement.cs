@@ -21,7 +21,7 @@ public sealed partial class MainWindow
         var rail = new DockPanel { Background = WorkbenchTheme.Navy };
         var brand = new StackPanel { Margin = new Thickness(20, 26, 16, 30) };
         brand.Children.Add(WorkbenchTheme.Icon("shield", Accent, 28));
-        brand.Children.Add(new TextBlock { Text = "CLOAK", FontFamily = new FontFamily("Segoe UI"), FontSize = 19, FontWeight = FontWeights.SemiBold, Foreground = Text, Margin = new Thickness(0, 12, 0, 2) });
+        brand.Children.Add(new TextBlock { Text = Environment.GetEnvironmentVariable("CLOAK_WORKBENCH_BRAND") ?? "CLOAK", FontFamily = new FontFamily("Segoe UI"), FontSize = 19, FontWeight = FontWeights.SemiBold, Foreground = Text, Margin = new Thickness(0, 12, 0, 2) });
         brand.Children.Add(Label("多账号工作台", 10, Muted));
         DockPanel.SetDock(brand, Dock.Top); rail.Children.Add(brand);
         var foot = new StackPanel { Margin = new Thickness(20, 0, 14, 22) };
@@ -36,13 +36,14 @@ public sealed partial class MainWindow
             ("browser", "视频生成", "视频生成", ShowVideoPage),
             ("settings", "批量管理", "环境管理", ShowAccountCenter),
             ("settings", "代理管理", "代理管理", ShowProxyPage),
-            ("diagnostic", "运行诊断", "运行诊断", ShowDiagnostics) }) {
+            ("diagnostic", "运行诊断", "运行诊断", ShowDiagnostics),
+            ("download", "备份与恢复", "备份与恢复", ShowConfigurationTransfer) }) {
             var b = IconButton(icon, label, callback); b.HorizontalContentAlignment = HorizontalAlignment.Left;
-            b.Padding = new Thickness(12, 13, 8, 13); b.Margin = new Thickness(0, 0, 0, 6); b.BorderThickness = new Thickness(0);
+            b.Padding = new Thickness(10, 11, 6, 11); b.Margin = new Thickness(0, 0, 0, 6); b.BorderThickness = new Thickness(0);
             b.Background = key == currentPage ? Hex("#203B33") : Brushes.Transparent;
             AutomationProperties.SetName(b, key); navigationButtons[key] = b; nav.Children.Add(b);
         }
-        rail.Children.Add(nav); root.Children.Add(rail);
+        rail.Children.Add(new ScrollViewer { Content = nav, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled }); root.Children.Add(rail);
         var workspace = environmentWorkspace;
         workspace.RowDefinitions.Add(new RowDefinition());
         Grid.SetColumn(workspace, 1); root.Children.Add(workspace); Grid.SetColumn(proxyWorkspace, 1); root.Children.Add(proxyWorkspace);
@@ -52,6 +53,7 @@ public sealed partial class MainWindow
         Grid.SetColumn(enterpriseWorkspace, 1); root.Children.Add(enterpriseWorkspace);
         Grid.SetColumn(videoWorkspace, 1); root.Children.Add(videoWorkspace);
         Grid.SetColumn(profileSettingsWorkspace, 1); root.Children.Add(profileSettingsWorkspace);
+        Grid.SetColumn(configurationWorkspace, 1); root.Children.Add(configurationWorkspace);
         var body = new Grid(); body.ColumnDefinitions.Add(runningSidebarColumn); body.ColumnDefinitions.Add(new ColumnDefinition()); workspace.Children.Add(body);
         var accounts = new DockPanel();
         var head = new StackPanel { Margin = new Thickness(16, 20, 16, 0) }; DockPanel.SetDock(head, Dock.Top);

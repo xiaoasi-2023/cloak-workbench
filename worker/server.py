@@ -32,6 +32,7 @@ from login_accounts import LoginAccounts
 from workspaces import Workspaces
 from session_backup import SessionBackups, MAX_BYTES
 from video_tasks import VideoTasks
+from config_transfer import ConfigTransfer, recover_import, MAX_FILE
 
 
 class ApiError(Exception):
@@ -117,6 +118,7 @@ class BrowserWorker:
     def __init__(self, data_dir: Path, binary: Path):
         self.data_dir, self.binary = data_dir.resolve(), binary.resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        recover_import(self.data_dir)
         self.profile_file = self.data_dir / "profiles.json"
         self.lock = threading.RLock()
         self.opener = build_opener(ProxyHandler({}))
@@ -140,6 +142,7 @@ class BrowserWorker:
         self.workspaces = Workspaces(self, ApiError)
         self.session_backups = SessionBackups(self, ApiError)
         self.videos = VideoTasks(self, ApiError)
+        self.config_transfer = ConfigTransfer(self, ApiError, validate_profile)
 
     def save(self):
         temp = self.profile_file.with_suffix(".json.tmp")
@@ -739,7 +742,7 @@ def make_handler(worker, token):
                 raise ApiError(405, "Method not allowed")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                limit = MAX_BYTES * 2 + 65536 if parts == ['sessions', 'preview'] else 262144 if parts[:1] == ['workspaces'] else 65536
+                limit = MAX_FILE + 65536 if parts[:1] == ['config-transfer'] else MAX_BYTES * 2 + 65536 if parts == ['sessions', 'preview'] else 262144 if parts[:1] == ['workspaces'] else 65536
                 if length < 0 or length > limit:
                     raise ValueError()
                 payload = json.loads(self.rfile.read(length) or b"{}")
@@ -749,6 +752,12 @@ def make_handler(worker, token):
                 raise ApiError(400, "Expected a JSON object smaller than 64 KiB")
             if parts == ["profiles"]:
                 return worker.create(payload)
+            if parts == ['config-transfer', 'export']:
+                return worker.config_transfer.export(payload)
+            if parts == ['config-transfer', 'preview']:
+                return worker.config_transfer.preview(payload)
+            if parts == ['config-transfer', 'import']:
+                return worker.config_transfer.apply(payload)
             if parts == ['video-tasks']:
                 return worker.videos.start(payload)
             if len(parts) == 3 and parts[0] == 'video-tasks':
@@ -939,6 +948,7 @@ def main():
     root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--data-dir", type=Path, default=root / "data")
     parser.add_argument("--browser", type=Path, default=Path(os.environ.get("CLOAK_WORKBENCH_BROWSER", str(Path.home() / ".cloakbrowser" / "chromium-146.0.7680.177.5" / "chrome.exe"))))
     args = parser.parse_args()
@@ -949,7 +959,11 @@ def main():
     atexit.register(worker.shutdown)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(worker, token))
     server.daemon_threads = True
-    print(f"Cloak Workbench worker ready at http://127.0.0.1:{args.port}", flush=True)
+    if args.ready_file:
+        temporary = args.ready_file.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'pid': os.getpid(), 'port': server.server_port}), encoding='utf-8')
+        temporary.replace(args.ready_file)
+    print(f"Cloak Workbench worker ready at http://127.0.0.1:{server.server_port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

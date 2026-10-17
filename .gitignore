@@ -1,6 +1,7 @@
 .tools/
 .venv/
 .local/
+dist/
 data/
 desktop/bin/
 desktop/obj/
